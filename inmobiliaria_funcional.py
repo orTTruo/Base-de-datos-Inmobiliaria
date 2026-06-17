@@ -524,7 +524,7 @@ calendario = Calendar(
     selectmode='day', 
     date_pattern='yyyy-mm-dd', 
     style='custom.Calendar.ttk',     # Pasar el mapeo limpio corregido
-    background='#1A237E',            # Barra superior (Fondo)
+    background='#808080',            # Barra superior (Fondo)
     foreground='#FFFFFF',            # Texto de la barra superior (Mes y Año en BLANCO)
     headersbackground='#1A237E',     # Fondo de la barra de días de la semana
     headersforeground='#FFFFFF',     # Letras de los días L M M J V S D (En BLANCO)
@@ -594,6 +594,34 @@ def guardar_asesor():
     txt_nom_as.delete(0, 'end'); txt_tel_as.delete(0, 'end'); txt_cor_as.delete(0, 'end')
     actualizar_tabla_asesores()
 
+def borrar_asesor_seleccionado():
+    seleccion = tree_asesores.selection()
+    if not seleccion:
+        messagebox.showwarning("Selección vacía", "Por favor, selecciona un asesor de la lista para poder eliminarlo.")
+        return
+    
+    datos_asesor = tree_asesores.item(seleccion[0], "values")
+    id_asesor = datos_asesor[0]
+    nombre_asesor = datos_asesor[1]
+    
+    if int(id_asesor) == 1:
+        messagebox.showerror("Error", "El 'Asesor General' es el sistema por defecto y no puede ser eliminado.")
+        return
+        
+    if messagebox.askyesno("Confirmar Eliminación", f"¿Estás seguro de que deseas dar de baja a {nombre_asesor}?\n\nNota: Sus clientes e inmuebles serán reasignados al Asesor General."):
+        with sqlite3.connect(DB) as conn:
+            cursor = conn.cursor()
+            # 1. Reasignar inmuebles de este asesor al Asesor General (ID 1)
+            cursor.execute("UPDATE inmuebles SET id_asesor = 1 WHERE id_asesor = ?", (id_asesor,))
+            # 2. Reasignar clientes de este asesor al Asesor General (ID 1)
+            cursor.execute("UPDATE clientes SET id_asesor = 1 WHERE id_asesor = ?", (id_asesor,))
+            # 3. Desactivar lógicamente al asesor
+            cursor.execute("UPDATE asesores SET activo = 0 WHERE id_asesor = ?", (id_asesor,))
+            conn.commit()
+            
+        messagebox.showinfo("Baja Exitosa", f"El asesor {nombre_asesor} ha sido dado de baja y sus cuentas transferidas.")
+        actualizar_tabla_asesores()
+
 def actualizar_tabla_asesores():
     for item in tree_asesores.get_children(): tree_asesores.delete(item)
     with sqlite3.connect(DB) as conn:
@@ -612,7 +640,10 @@ ctk.CTkButton(frame_form_as, text="➕ Añadir Asesor", fg_color="#2E7D32", comm
 
 tree_asesores = ttk.Treeview(frame_asesores, columns=("ID", "NOMBRE", "TELEFONO", "CORREO"), show="headings")
 for col in ("ID", "NOMBRE", "TELEFONO", "CORREO"): tree_asesores.heading(col, text=col)
-tree_asesores.pack(fill="both", expand=True, padx=20, pady=15)
+tree_asesores.pack(fill="both", expand=True, padx=20, pady=10)
+
+# BOTÓN DE ACCIÓN AGREGADO: BORRAR ASESOR SELECCIONADO
+ctk.CTkButton(frame_asesores, text="❌ Dar de Baja Asesor Seleccionado", fg_color="#D32F2F", hover_color="#C62828", command=borrar_asesor_seleccionado).pack(anchor="w", padx=20, pady=(0, 20))
 
 # --------------------------------------------------------
 # VISTA: PAPELERA DE RECICLAJE
@@ -822,7 +853,7 @@ def mostrar_inmuebles():
             estilo_negrita = ParagraphStyle('B', fontName='Helvetica-Bold', fontSize=10, leading=14, textColor=colors.HexColor('#1A237E'))
 
             elementos = [
-                Paragraph("<b>GARANZIA REAL ESTATE</b>", estilo_titulo),
+                Paragraph("<b>GARANZIA INMOBILIARIA</b>", estilo_titulo),
                 Paragraph(f"Ficha Comercial Avanzada — ID Ref: #{id_inmueble}", estilo_sub),
                 Spacer(1, 10)
             ]
