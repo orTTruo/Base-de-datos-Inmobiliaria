@@ -35,81 +35,111 @@ combo_asesor_inm = None
 combo_asesor_cli = None
 
 # --------------------------------------------------------
-# BASE DE DATOS: INICIALIZACIÓN COMPLETA
+# BASE DE DATOS: CONEXIÓN INTEGRAL CON LLAVES FORÁNEAS
 # --------------------------------------------------------
+def conectar_bd():
+    """Establece conexión con la BD y fuerza la integridad referencial."""
+    conn = sqlite3.connect(DB)
+    conn.execute("PRAGMA foreign_keys = ON;")
+    return conn
+
 def inicializar_bd():
-    with sqlite3.connect(DB) as conn:
+    with conectar_bd() as conn:
         cursor = conn.cursor()
         
+        # 1. Tabla de Asesores
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS asesores (
                 id_asesor INTEGER PRIMARY KEY AUTOINCREMENT,
-                nombre TEXT,
+                nombre TEXT NOT NULL,
                 telefono TEXT,
                 correo TEXT,
-                activo INTEGER DEFAULT 1
+                activo INTEGER DEFAULT 1 CHECK(activo IN (0, 1))
             )
         """)
         
+        # 2. Catálogo Normalizado de Ubicaciones
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS ubicaciones (
+                id_ubicacion INTEGER PRIMARY KEY AUTOINCREMENT,
+                colonia TEXT NOT NULL,
+                municipio TEXT NOT NULL,
+                estado TEXT NOT NULL,
+                UNIQUE(colonia, municipio, estado)
+            )
+        """)
+        
+        # 3. Tabla de Inmuebles Mejorada (CHECKs, Auditoría y Llaves Foráneas estrictas)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS inmuebles (
                 id_inmueble INTEGER PRIMARY KEY AUTOINCREMENT,
-                tipo_operacion TEXT,
-                tipo_inmueble TEXT,
-                titulo TEXT,
-                precio REAL,
-                colonia TEXT,
-                municipio TEXT,
-                estado TEXT,
+                tipo_operacion TEXT NOT NULL CHECK(tipo_operacion IN ('VENTA', 'RENTA')),
+                tipo_inmueble TEXT NOT NULL CHECK(tipo_inmueble IN ('Casa', 'Departamento', 'Terreno', 'Local', 'Oficina')),
+                titulo TEXT NOT NULL,
+                precio REAL NOT NULL CHECK(precio >= 0),
+                id_ubicacion INTEGER NOT NULL,
                 descripcion TEXT,
-                m2_terreno REAL,
-                m2_construccion REAL,
-                id_asesor INTEGER,
-                eliminado INTEGER DEFAULT 0,
-                FOREIGN KEY(id_asesor) REFERENCES asesores(id_asesor)
+                m2_terreno REAL DEFAULT 0.0,
+                m2_construccion REAL DEFAULT 0.0,
+                id_asesor INTEGER NOT NULL,
+                eliminado INTEGER DEFAULT 0 CHECK(eliminado IN (0, 1)),
+                fecha_registro TEXT DEFAULT (datetime('now', 'localtime')),
+                FOREIGN KEY(id_asesor) REFERENCES asesores(id_asesor) ON DELETE RESTRICT,
+                FOREIGN KEY(id_ubicacion) REFERENCES ubicaciones(id_ubicacion)
             )
         """)
         
+        # 4. Tabla de Fotos de Inmuebles
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS fotos_inmueble (
                 id_foto INTEGER PRIMARY KEY AUTOINCREMENT,
-                id_inmueble INTEGER,
-                ruta_archivo TEXT,
+                id_inmueble INTEGER NOT NULL,
+                ruta_archivo TEXT NOT NULL,
                 descripcion TEXT,
-                principal INTEGER,
-                FOREIGN KEY(id_inmueble) REFERENCES inmuebles(id_inmueble)
+                principal INTEGER DEFAULT 0 CHECK(principal IN (0, 1)),
+                FOREIGN KEY(id_inmueble) REFERENCES inmuebles(id_inmueble) ON DELETE CASCADE
             )
         """)
         
+        # 5. Tabla de Clientes con Auditoría
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS clientes (
                 id_cliente INTEGER PRIMARY KEY AUTOINCREMENT,
-                nombre TEXT,
+                nombre TEXT NOT NULL,
                 telefono TEXT,
                 correo TEXT,
-                presupuesto_max REAL,
-                zona_interes TEXT,
-                tipo_buscado TEXT,
-                operacion_buscada TEXT DEFAULT 'VENTA',
+                presupuesto_max REAL DEFAULT 0.0,
+                id_ubicacion_interes INTEGER,
+                tipo_buscado TEXT CHECK(tipo_buscado IN ('Casa', 'Departamento', 'Terreno', 'Local', 'Oficina')),
+                operacion_buscada TEXT DEFAULT 'VENTA' CHECK(operacion_buscada IN ('VENTA', 'RENTA')),
                 m2_minimos REAL DEFAULT 0.0,
-                id_asesor INTEGER,
-                FOREIGN KEY(id_asesor) REFERENCES asesores(id_asesor)
+                id_asesor INTEGER NOT NULL,
+                fecha_registro TEXT DEFAULT (datetime('now', 'localtime')),
+                FOREIGN KEY(id_asesor) REFERENCES asesores(id_asesor) ON DELETE RESTRICT,
+                FOREIGN KEY(id_ubicacion_interes) REFERENCES ubicaciones(id_ubicacion)
             )
         """)
         
+        # 6. Tabla de Citas Robustecida (Evita Overbooking en la misma propiedad y añade Estados)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS citas (
                 id_cita INTEGER PRIMARY KEY AUTOINCREMENT,
-                id_cliente INTEGER,
-                id_inmueble INTEGER,
-                fecha TEXT,
-                hora TEXT,
+                id_cliente INTEGER NOT NULL,
+                id_inmueble INTEGER NOT NULL,
+                fecha_hora TEXT NOT NULL, -- Formato: YYYY-MM-DD HH:MM
+                estado TEXT DEFAULT 'Pendiente' CHECK(estado IN ('Pendiente', 'Realizada', 'Cancelada')),
                 notas TEXT,
-                FOREIGN KEY(id_cliente) REFERENCES clientes(id_cliente),
-                FOREIGN KEY(id_inmueble) REFERENCES inmuebles(id_inmueble)
+                FOREIGN KEY(id_cliente) REFERENCES clientes(id_cliente) ON DELETE CASCADE,
+                FOREIGN KEY(id_inmueble) REFERENCES inmuebles(id_inmueble) ON DELETE CASCADE,
+                UNIQUE(id_inmueble, fecha_hora)
             )
         """)
 
+        # Índices de optimización para búsquedas veloces
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_inmuebles_busqueda ON inmuebles (tipo_inmueble, precio, eliminado);")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_clientes_busqueda ON clientes (tipo_buscado, presupuesto_max);")
+
+        # Asegurar el Asesor por defecto
         cursor.execute("SELECT COUNT(*) FROM asesores")
         if cursor.fetchone()[0] == 0:
             cursor.execute("INSERT INTO asesores (nombre, telefono, correo, activo) VALUES ('Asesor General', '5500000000', 'general@garanzia.com', 1)")
@@ -119,22 +149,42 @@ def inicializar_bd():
 inicializar_bd()
 
 # --------------------------------------------------------
+# FUNCIONES DE CONTROL DE UBICACIONES (NORMALIZACIÓN)
+# --------------------------------------------------------
+def obtener_o_crear_ubicacion(colonia, municipio, estado):
+    """Busca una ubicación exacta. Si no existe, la crea limpia."""
+    col = colonia.strip().title()
+    mun = municipio.strip().title()
+    est = estado.strip().title()
+    
+    with conectar_bd() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id_ubicacion FROM ubicaciones WHERE colonia=? AND municipio=? AND estado=?", (col, mun, est))
+        res = cursor.fetchone()
+        if res:
+            return res[0]
+        else:
+            cursor.execute("INSERT INTO ubicaciones (colonia, municipio, estado) VALUES (?,?,?)", (col, mun, est))
+            conn.commit()
+            return cursor.lastrowid
+
+# --------------------------------------------------------
 # FUNCIONES DE UTILIDAD (DROPDOWNS Y ASESORES)
 # --------------------------------------------------------
 def obtener_lista_asesores():
-    with sqlite3.connect(DB) as conn:
+    with conectar_bd() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT nombre FROM asesores WHERE activo = 1")
         return [row[0] for row in cursor.fetchall()]
 
 def obtener_lista_clientes_combo():
-    with sqlite3.connect(DB) as conn:
+    with conectar_bd() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT id_cliente, nombre FROM clientes")
         return [f"{row[0]} - {row[1]}" for row in cursor.fetchall()]
 
 def obtener_lista_inmuebles_combo():
-    with sqlite3.connect(DB) as conn:
+    with conectar_bd() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT id_inmueble, titulo FROM inmuebles WHERE eliminado = 0")
         return [f"{row[0]} - {row[1]}" for row in cursor.fetchall()]
@@ -149,23 +199,22 @@ def actualizar_combos_asesores():
         combo_asesor_cli.set(lista[0] if lista else "Seleccionar Asesor...")
 
 def obtener_id_asesor_por_nombre(nombre_asesor):
-    with sqlite3.connect(DB) as conn:
+    with conectar_bd() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT id_asesor FROM asesores WHERE nombre = ?", (nombre_asesor,))
         res = cursor.fetchone()
         return res[0] if res else 1
 
 # --------------------------------------------------------
-# LÓGICA DE CRUCE / MATCH AUTOMÁTICO
+# LÓGICA DE CRUCE / MATCH AUTOMÁTICO INDEPENDIENTE DE TEXTO
 # --------------------------------------------------------
-def calcular_y_mostrar_match(tipo_buscado, presupuesto_max, zona_interes, nombre_cliente):
+def calcular_y_mostrar_match(tipo_buscado, presupuesto_max, id_ubicacion_interes, nombre_cliente):
     ventana_match = ctk.CTkToplevel(app)
     ventana_match.title(f"Coincidencias de Inventario para: {nombre_cliente}")
     ventana_match.geometry("900x450")
     ventana_match.after(100, lambda: ventana_match.focus())
 
     ctk.CTkLabel(ventana_match, text=f"Propiedades encontradas para {nombre_cliente}", font=("Arial", 16, "bold"), text_color="#1A237E").pack(pady=10)
-    ctk.CTkLabel(ventana_match, text=f"Criterio: {tipo_buscado} | Presupuesto Máx: ${presupuesto_max:,.2f} | Zona: {zona_interes}", font=("Arial", 11, "italic")).pack(pady=2)
 
     frame_tabla_match = ctk.CTkFrame(ventana_match)
     frame_tabla_match.pack(fill="both", expand=True, padx=15, pady=15)
@@ -177,30 +226,31 @@ def calcular_y_mostrar_match(tipo_buscado, presupuesto_max, zona_interes, nombre
         tree_match.column(col, width=110, anchor="center")
     tree_match.pack(side="left", fill="both", expand=True)
 
-    zona_query = f"%{zona_interes.strip()}%"
-    with sqlite3.connect(DB) as conn:
+    with conectar_bd() as conn:
         cursor = conn.cursor()
+        # El Match ahora es robusto gracias a la relación directa con id_ubicacion
         cursor.execute("""
-            SELECT id_inmueble, tipo_operacion, tipo_inmueble, titulo, precio, colonia, municipio 
-            FROM inmuebles 
-            WHERE eliminado = 0 
-              AND LOWER(tipo_inmueble) = LOWER(?) 
-              AND precio <= ? 
-              AND (LOWER(colonia) LIKE LOWER(?) OR LOWER(municipio) LIKE LOWER(?))
-        """, (tipo_buscado, presupuesto_max, zona_query, zona_query))
+            SELECT i.id_inmueble, i.tipo_operacion, i.tipo_inmueble, i.titulo, i.precio, u.colonia, u.municipio 
+            FROM inmuebles i
+            JOIN ubicaciones u ON i.id_ubicacion = u.id_ubicacion
+            WHERE i.eliminado = 0 
+              AND i.tipo_inmueble = ? 
+              AND i.precio <= ? 
+              AND i.id_ubicacion = ?
+        """, (tipo_buscado, presupuesto_max, id_ubicacion_interes))
         
         filas = cursor.fetchall()
         for r in filas: 
             tree_match.insert("", "end", values=r)
 
     if not filas:
-        messagebox.showinfo("Sin Coincidencias", "No se encontraron propiedades en inventario que cumplan todos los filtros de este cliente por el momento.", parent=ventana_match)
+        messagebox.showinfo("Sin Coincidencias", "No se encontraron propiedades exactas en la misma colonia elegida por el momento.", parent=ventana_match)
 
 # --------------------------------------------------------
 # VENTANA PRINCIPAL Y CONFIGURACIÓN DE NAVEGACIÓN
 # --------------------------------------------------------
 app = ctk.CTk()
-app.title("CRM Inmobiliario Garanzia v2.8")
+app.title("CRM Inmobiliario Garanzia v3.0 Normalizado")
 app.geometry("1350x850")
 
 frame_dashboard = ctk.CTkFrame(app, corner_radius=0, fg_color="#F5F5F5")
@@ -279,32 +329,52 @@ lbl_sub_citas.pack(pady=5, padx=20, anchor="w")
 
 def actualizar_metricas_dashboard():
     hoy_str = datetime.now().strftime("%Y-%m-%d")
-    with sqlite3.connect(DB) as conn:
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM inmuebles WHERE eliminado = 0")
-        total_inm = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM clientes")
-        total_cli = cursor.fetchone()[0]
-        cursor.execute("SELECT SUM(precio) FROM inmuebles WHERE eliminado = 0")
-        valor_portafolio = cursor.fetchone()[0] or 0.0
-        cursor.execute("SELECT AVG(precio) FROM inmuebles WHERE eliminado = 0")
-        promedio_prop = cursor.fetchone()[0] or 0.0
-        cursor.execute("SELECT COUNT(*) FROM citas WHERE fecha = ?", (hoy_str,))
-        citas_hoy = cursor.fetchone()[0]
+    filtro_fecha = hoy_str + "%"
+    
+    try:
+        with conectar_bd() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT COUNT(*) FROM inmuebles WHERE eliminado = 0")
+            total_inm = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM clientes")
+            total_cli = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT SUM(precio) FROM inmuebles WHERE eliminado = 0")
+            valor_portafolio = cursor.fetchone()[0] or 0.0
+            
+            cursor.execute("SELECT AVG(precio) FROM inmuebles WHERE eliminado = 0")
+            promedio_prop = cursor.fetchone()[0] or 0.0
+            
+            cursor.execute("SELECT COUNT(*) FROM citas WHERE fecha_hora LIKE ?", (filtro_fecha,))
+            citas_hoy = cursor.fetchone()[0]
 
-        lbl_kpi_inmuebles.configure(text=f"Total: {total_inm}")
-        lbl_kpi_clientes.configure(text=str(total_cli))
-        lbl_kpi_valor.configure(text=f"${valor_portafolio:,.2f}")
-        lbl_sub_promedio.configure(text=f"📊 Valor Promedio de Propiedad: ${promedio_prop:,.2f}")
-        lbl_sub_citas.configure(text=f"📅 Agenda: {citas_hoy} citas agendadas para hoy")
+            lbl_kpi_inmuebles.configure(text=f"Total: {total_inm}")
+            lbl_kpi_clientes.configure(text=str(total_cli))
+            lbl_kpi_valor.configure(text=f"${valor_portafolio:,.2f}")
+            lbl_sub_promedio.configure(text=f"📊 Valor Promedio de Propiedad: ${promedio_prop:,.2f}")
+            lbl_sub_citas.configure(text=f"📅 Agenda: {citas_hoy} citas agendadas para hoy")
+            
+    except sqlite3.Error as e:
+        print(f"--- [Aviso de Base de Datos] ---")
+        print(f"Error al inicializar métricas: {e}")
+        print(f"Si cambiaste la estructura de las tablas recientemente, recuerda borrar el archivo database/inmobiliaria.db para regenerarlo.")
+        print(f"---------------------------------")
+        
+        # Muestra ceros de forma segura en la interfaz en lugar de romper el programa
+        lbl_kpi_inmuebles.configure(text="Total: 0")
+        lbl_kpi_clientes.configure(text="0")
+        lbl_kpi_valor.configure(text="$0.00")
+        lbl_sub_promedio.configure(text="📊 Valor Promedio de Propiedad: $0.00")
+        lbl_sub_citas.configure(text="📅 Agenda: 0 citas agendadas para hoy")
 
 # --------------------------------------------------------
 # VISTA: ALTA DE INMUEBLES
 # --------------------------------------------------------
 def guardar_inmueble():
-    if not txt_titulo.get().strip() or not txt_precio.get().strip():
-        messagebox.showwarning("Campos incompletos", "Título y Precio son obligatorios.")
+    if not txt_titulo.get().strip() or not txt_precio.get().strip() or not txt_colonia.get().strip():
+        messagebox.showwarning("Campos incompletos", "Título, Precio y Colonia son obligatorios.")
         return
     try:
         precio = float(txt_precio.get().replace(",", "").replace("$", "").strip())
@@ -314,15 +384,18 @@ def guardar_inmueble():
         messagebox.showerror("Error", "Inserta valores numéricos válidos.")
         return
 
+    # Normalizar ubicación
+    id_ub = obtener_o_crear_ubicacion(txt_colonia.get(), txt_municipio.get(), txt_estado.get())
     id_ase = obtener_id_asesor_por_nombre(combo_asesor_inm.get())
-    with sqlite3.connect(DB) as conn:
+    
+    with conectar_bd() as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO inmuebles (tipo_operacion, tipo_inmueble, titulo, precio, colonia, municipio, estado, descripcion, m2_terreno, m2_construccion, id_asesor, eliminado)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,0)
-        """, (combo_operacion.get(), combo_tipo.get(), txt_titulo.get().strip(), precio, txt_colonia.get().strip(), txt_municipio.get().strip(), txt_estado.get().strip(), txt_descripcion.get().strip(), m2_t, m2_c, id_ase))
+            INSERT INTO inmuebles (tipo_operacion, tipo_inmueble, titulo, precio, id_ubicacion, descripcion, m2_terreno, m2_construccion, id_asesor, eliminado)
+            VALUES (?,?,?,?,?,?,?,?,?,0)
+        """, (combo_operacion.get(), combo_tipo.get(), txt_titulo.get().strip(), precio, id_ub, txt_descripcion.get().strip(), m2_t, m2_c, id_ase))
         conn.commit()
-    messagebox.showinfo("Éxito", "Inmueble añadido exitosamente.")
+    messagebox.showinfo("Éxito", "Inmueble añadido exitosamente a la base de datos.")
     limpiar_inmueble()
 
 def limpiar_inmueble():
@@ -350,11 +423,11 @@ ctk.CTkButton(frame_alta_inmuebles, text="💾 Guardar Inmueble", command=guarda
 # --------------------------------------------------------
 def guardar_cliente():
     nombre_cli = txt_nombre_cli.get().strip()
-    zona_cli = txt_zona_cli.get().strip()
+    colonia_cli = txt_zona_cli.get().strip()
     tipo_interes = combo_tipo_buscado.get()
 
-    if not nombre_cli:
-        messagebox.showwarning("Campos vacíos", "El nombre del cliente es obligatorio.")
+    if not nombre_cli or not colonia_cli:
+        messagebox.showwarning("Campos vacíos", "El nombre y la colonia de interés son obligatorios.")
         return
     try:
         presupuesto = float(txt_presupuesto.get().replace(",", "").replace("$", "").strip()) if txt_presupuesto.get() else 0.0
@@ -362,18 +435,20 @@ def guardar_cliente():
         messagebox.showerror("Error", "Por favor ingresa un presupuesto numérico válido.")
         return
 
+    # Vinculación normalizada de ubicación
+    id_ub = obtener_o_crear_ubicacion(colonia_cli, "Por Definir", "Por Definir")
     id_ase = obtener_id_asesor_por_nombre(combo_asesor_cli.get())
     
-    with sqlite3.connect(DB) as conn:
+    with conectar_bd() as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO clientes (nombre, telefono, correo, presupuesto_max, zona_interes, tipo_buscado, operacion_buscada, id_asesor)
+            INSERT INTO clientes (nombre, telefono, correo, presupuesto_max, id_ubicacion_interes, tipo_buscado, operacion_buscada, id_asesor)
             VALUES (?, ?, ?, ?, ?, ?, 'VENTA', ?)
-        """, (nombre_cli, txt_tel_cli.get().strip(), txt_correo_cli.get().strip(), presupuesto, zona_cli, tipo_interes, id_ase))
+        """, (nombre_cli, txt_tel_cli.get().strip(), txt_correo_cli.get().strip(), presupuesto, id_ub, tipo_interes, id_ase))
         conn.commit()
         
-    messagebox.showinfo("Éxito", f"¡Cliente registrado con éxito!\nIniciando cruce automático de requerimientos...")
-    calcular_y_mostrar_match(tipo_interes, presupuesto, zona_cli, nombre_cli)
+    messagebox.showinfo("Éxito", f"¡Cliente registrado con éxito!\nEjecutando Cruce Estricto Relacional...")
+    calcular_y_mostrar_match(tipo_interes, presupuesto, id_ub, nombre_cli)
     limpiar_cliente()
 
 def limpiar_cliente():
@@ -385,7 +460,7 @@ txt_nombre_cli = ctk.CTkEntry(frame_alta_clientes, width=400, placeholder_text="
 txt_tel_cli = ctk.CTkEntry(frame_alta_clientes, width=400, placeholder_text="Teléfono Celular"); txt_tel_cli.pack(pady=5)
 txt_correo_cli = ctk.CTkEntry(frame_alta_clientes, width=400, placeholder_text="Correo Electrónico"); txt_correo_cli.pack(pady=5)
 txt_presupuesto = ctk.CTkEntry(frame_alta_clientes, width=400, placeholder_text="Presupuesto Máximo de Compra"); txt_presupuesto.pack(pady=5)
-txt_zona_cli = ctk.CTkEntry(frame_alta_clientes, width=400, placeholder_text="Zonas de interés"); txt_zona_cli.pack(pady=5)
+txt_zona_cli = ctk.CTkEntry(frame_alta_clientes, width=400, placeholder_text="Colonia Específica de interés"); txt_zona_cli.pack(pady=5)
 combo_tipo_buscado = ctk.CTkComboBox(frame_alta_clientes, values=["Casa", "Departamento", "Terreno", "Local", "Oficina"], width=400); combo_tipo_buscado.pack(pady=5)
 combo_asesor_cli = ctk.CTkComboBox(frame_alta_clientes, values=[], width=400); combo_asesor_cli.pack(pady=5)
 
@@ -411,37 +486,37 @@ def mostrar_clientes():
     frame_t = ctk.CTkFrame(ventana_cartera)
     frame_t.pack(fill="both", expand=True, padx=15, pady=5)
 
-    columnas = ("ID", "NOMBRE", "TELEFONO", "CORREO", "PRESUPUESTO", "ZONA", "TIPO BUSCADO")
+    columnas = ("ID", "NOMBRE", "TELEFONO", "CORREO", "PRESUPUESTO", "ID_UBICACION", "TIPO BUSCADO")
     tree = ttk.Treeview(frame_t, columns=columnas, show="headings")
     for col in columnas: 
         tree.heading(col, text=col)
         tree.column(col, anchor="center")
     tree.pack(side="left", fill="both", expand=True)
 
-    with sqlite3.connect(DB) as conn:
+    with conectar_bd() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT id_cliente, nombre, telefono, correo, presupuesto_max, zona_interes, tipo_buscado FROM clientes")
+        cursor.execute("SELECT id_cliente, nombre, telefono, correo, presupuesto_max, id_ubicacion_interes, tipo_buscado FROM clientes")
         for r in cursor.fetchall(): tree.insert("", "end", values=r)
 
     def ejecutar_match_desde_tabla():
         sel = tree.selection()
         if not sel:
-            messagebox.showwarning("Selección vacía", "Por favor, selecciona un cliente de la lista para ver sus propiedades cruzadas.")
+            messagebox.showwarning("Selección vacía", "Selecciona un cliente de la lista.")
             return
         
         datos = tree.item(sel[0], "values")
         nombre = datos[1]
         try: presupuesto = float(datos[4])
         except: presupuesto = 0.0
-        zona = datos[5]
+        id_ub = int(datos[5])
         tipo = datos[6]
 
-        calcular_y_mostrar_match(tipo, presupuesto, zona, nombre)
+        calcular_y_mostrar_match(tipo, presupuesto, id_ub, nombre)
 
     ctk.CTkButton(frame_acciones_cli, text="⚡ Encontrar Inmuebles (Auto-Match)", fg_color="#E65100", command=ejecutar_match_desde_tabla).pack(side="left", padx=5)
 
 # --------------------------------------------------------
-# VISTA: AGENDA DE CITAS
+# VISTA: AGENDA DE CITAS COMPACTA DATETIME
 # --------------------------------------------------------
 def agendar_cita():
     cli_sel = combo_agenda_cliente.get()
@@ -452,33 +527,36 @@ def agendar_cita():
     
     id_c = cli_sel.split(" - ")[0]
     id_i = inm_sel.split(" - ")[0]
-    fecha_sel = calendario.get_date()
-    hora_sel = f"{combo_hora.get()}:{combo_minuto.get()}"
     
-    with sqlite3.connect(DB) as conn:
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO citas (id_cliente, id_inmueble, fecha, hora, notas) VALUES (?,?,?,?,?)",
-                       (id_c, id_i, fecha_sel, hora_sel, txt_notas_cita.get().strip()))
-        conn.commit()
-    messagebox.showinfo("Éxito", "Cita agendada correctamente.")
-    actualizar_componentes_agenda()
+    # Combinación de fecha y hora bajo el estándar DATETIME estructurado
+    fecha_hora_combinada = f"{calendario.get_date()} {combo_hora.get()}:{combo_minuto.get()}"
+    
+    try:
+        with conectar_bd() as conn:
+            cursor = conn.cursor()
+            cursor.execute("INSERT INTO citas (id_cliente, id_inmueble, fecha_hora, estado, notas) VALUES (?,?,?, 'Pendiente', ?)",
+                           (id_c, id_i, fecha_hora_combinada, txt_notas_cita.get().strip()))
+            conn.commit()
+        messagebox.showinfo("Éxito", "Cita agendada correctamente.")
+        actualizar_componentes_agenda()
+    except sqlite3.IntegrityError:
+        messagebox.showerror("Conflicto de Agenda", "Error de Overbooking: Este inmueble ya tiene una cita programada exactamente a esa misma fecha y hora.")
 
 def eliminar_cita():
     seleccion = tree_agenda.selection()
     if not seleccion:
-        messagebox.showwarning("Selección vacía", "Por favor, selecciona una cita de la tabla inferior para poder eliminarla.")
+        messagebox.showwarning("Selección vacía", "Por favor, selecciona una cita de la tabla inferior.")
         return
     
     datos_cita = tree_agenda.item(seleccion[0], "values")
     id_cita = datos_cita[0]
-    cliente_nom = datos_cita[1]
     
-    if messagebox.askyesno("Confirmar Eliminación", f"¿Estás seguro de que deseas cancelar y eliminar permanentemente la cita de {cliente_nom}?"):
-        with sqlite3.connect(DB) as conn:
+    if messagebox.askyesno("Confirmar Eliminación", "¿Estás seguro de que deseas cancelar y remover esta cita?"):
+        with conectar_bd() as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM citas WHERE id_cita = ?", (id_cita,))
             conn.commit()
-        messagebox.showinfo("Eliminado", "La cita ha sido removida de la agenda.")
+        messagebox.showinfo("Eliminado", "La cita ha sido removida.")
         actualizar_componentes_agenda()
 
 def actualizar_componentes_agenda():
@@ -486,14 +564,14 @@ def actualizar_componentes_agenda():
     combo_agenda_inmueble.configure(values=obtener_lista_inmuebles_combo())
     
     for item in tree_agenda.get_children(): tree_agenda.delete(item)
-    with sqlite3.connect(DB) as conn:
+    with conectar_bd() as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT c.id_cita, cl.nombre, i.titulo, c.fecha, c.hora 
+            SELECT c.id_cita, cl.nombre, i.titulo, c.fecha_hora, c.estado 
             FROM citas c
             JOIN clientes cl ON c.id_cliente = cl.id_cliente
             JOIN inmuebles i ON c.id_inmueble = i.id_inmueble
-            ORDER BY c.fecha ASC, c.hora ASC
+            ORDER BY c.fecha_hora ASC
         """)
         for r in cursor.fetchall(): tree_agenda.insert("", "end", values=r)
 
@@ -505,39 +583,17 @@ frame_modulo_agenda.pack(fill="x", padx=30, pady=10)
 frame_calendario_izq = ctk.CTkFrame(frame_modulo_agenda, fg_color="white", corner_radius=10)
 frame_calendario_izq.pack(side="left", fill="y", padx=(0, 15))
 
-
-# --- CONFIGURACIÓN DE CONTRASSTE DE ESTILOS DEL MOTOR GRÁFICO (TTK) ---
-# Esto obliga al sistema a pintar las fuentes del calendario en colores visibles.
 estilo_ttk = ttk.Style()
-estilo_ttk.theme_use('clam')  # Forzar tema nativo limpio para evitar bloqueos de CustomTkinter
-
-# Configura los días activos dentro de la cuadrícula seleccionada
+estilo_ttk.theme_use('clam')
 estilo_ttk.configure('custom.Calendar.ttk', background='#1A237E', foreground='white')
-estilo_ttk.map('custom.Calendar.ttk',
-    foreground=[('selected', '#FFFFFF'), ('active', '#1A237E')],
-    background=[('selected', '#1E88E5'), ('active', '#E8EAF6')]
-)
 
-# Inicialización del objeto Calendario con redefiniciones estrictas de color
 calendario = Calendar(
-    frame_calendario_izq, 
-    selectmode='day', 
-    date_pattern='yyyy-mm-dd', 
-    style='custom.Calendar.ttk',     # Pasar el mapeo limpio corregido
-    background='#808080',            # Barra superior (Fondo)
-    foreground='#FFFFFF',            # Texto de la barra superior (Mes y Año en BLANCO)
-    headersbackground='#1A237E',     # Fondo de la barra de días de la semana
-    headersforeground='#FFFFFF',     # Letras de los días L M M J V S D (En BLANCO)
-    normalbackground='#FFFFFF',      # Fondo del cuerpo de días
-    normalforeground='#111111',      # Números de los días (Negro/Gris oscuro nítido)
-    weekendbackground='#F5F5F5',     # Fines de semana
-    weekendforeground='#D32F2F',     # Sábados y domingos (Rojo oscuro nítido)
-    selectbackground='#1E88E5',      # Fondo del día seleccionado (Azul claro)
-    selectforeground='#FFFFFF',      # TEXTO DEL NÚMERO SELECCIONADO (Fijado en BLANCO)
-    tooltipalpha=0.0
+    frame_calendario_izq, selectmode='day', date_pattern='yyyy-mm-dd', style='custom.Calendar.ttk',
+    background='#1A237E', foreground='#FFFFFF', headersbackground='#1A237E', headersforeground='#FFFFFF',
+    normalbackground='#FFFFFF', normalforeground='#111111', weekendbackground='#F5F5F5', weekendforeground='#D32F2F',
+    selectbackground='#1E88E5', selectforeground='#FFFFFF', tooltipalpha=0.0
 )
 calendario.pack(padx=15, pady=15)
-
 
 frame_form_der = ctk.CTkFrame(frame_modulo_agenda, corner_radius=10, fg_color="white")
 frame_form_der.pack(side="left", fill="both", expand=True)
@@ -545,48 +601,42 @@ frame_form_der.pack(side="left", fill="both", expand=True)
 ctk.CTkLabel(frame_form_der, text="Agendar Nueva Cita", font=("Arial", 14, "bold"), text_color="black").pack(anchor="w", pady=(15, 10), padx=15)
 
 combo_agenda_cliente = ctk.CTkComboBox(frame_form_der, width=350, values=[])
-combo_agenda_cliente.pack(pady=5, padx=15, anchor="w")
-combo_agenda_cliente.set("Seleccionar Cliente Prospecto...")
+combo_agenda_cliente.pack(pady=5, padx=15, anchor="w"); combo_agenda_cliente.set("Seleccionar Cliente Prospecto...")
 
 combo_agenda_inmueble = ctk.CTkComboBox(frame_form_der, width=350, values=[])
-combo_agenda_inmueble.pack(pady=5, padx=15, anchor="w")
-combo_agenda_inmueble.set("Seleccionar Propiedad de Interés...")
+combo_agenda_inmueble.pack(pady=5, padx=15, anchor="w"); combo_agenda_inmueble.set("Seleccionar Propiedad de Interés...")
 
 frame_hora_linea = ctk.CTkFrame(frame_form_der, fg_color="transparent")
 frame_hora_linea.pack(pady=5, padx=15, anchor="w")
-ctk.CTkLabel(frame_hora_linea, text="Hora de la Cita: ", text_color="black").pack(side="left", padx=(0, 5))
+ctk.CTkLabel(frame_hora_linea, text="Hora: ", text_color="black").pack(side="left", padx=(0, 5))
 
 combo_hora = ctk.CTkComboBox(frame_hora_linea, width=80, values=[f"{i:02d}" for i in range(8, 21)])
 combo_hora.pack(side="left", padx=2)
 combo_minuto = ctk.CTkComboBox(frame_hora_linea, width=80, values=["00", "15", "30", "45"])
 combo_minuto.pack(side="left", padx=2)
 
-txt_notas_cita = ctk.CTkEntry(frame_form_der, width=350, placeholder_text="Objetivo de la visita (Ej: Cierre, Segunda muestra)")
+txt_notas_cita = ctk.CTkEntry(frame_form_der, width=350, placeholder_text="Objetivo de la visita")
 txt_notas_cita.pack(pady=10, padx=15, anchor="w")
 
-ctk.CTkButton(frame_form_der, text="📅 Confirmar y Registrar Cita", fg_color="#1A237E", hover_color="#283593", command=agendar_cita).pack(pady=(5, 15), padx=15, anchor="w")
+ctk.CTkButton(frame_form_der, text="📅 Registrar Cita Estricta", fg_color="#1A237E", command=agendar_cita).pack(pady=(5, 15), padx=15, anchor="w")
 
-# Panel inferior de visualización de agenda y botones de acción
 frame_lista_agenda = ctk.CTkFrame(frame_agenda, fg_color="transparent")
 frame_lista_agenda.pack(fill="both", expand=True, padx=30, pady=(10, 20))
 
-ctk.CTkLabel(frame_lista_agenda, text="📋 Próximas Citas en Agenda", font=("Arial", 14, "bold"), text_color="black").pack(anchor="w", pady=(0, 5))
-
-tree_agenda = ttk.Treeview(frame_lista_agenda, columns=("ID", "CLIENTE", "PROPIEDAD", "FECHA", "HORA"), show="headings")
-for col in ("ID", "CLIENTE", "PROPIEDAD", "FECHA", "HORA"): 
+tree_agenda = ttk.Treeview(frame_lista_agenda, columns=("ID", "CLIENTE", "PROPIEDAD", "FECHA_HORA", "ESTADO"), show="headings")
+for col in ("ID", "CLIENTE", "PROPIEDAD", "FECHA_HORA", "ESTADO"): 
     tree_agenda.heading(col, text=col)
     tree_agenda.column(col, anchor="center")
 tree_agenda.pack(fill="both", expand=True, pady=(0, 10))
 
-# BOTÓN DE ACCIÓN: ELIMINAR CITA SELECCIONADA
-ctk.CTkButton(frame_lista_agenda, text="❌ Eliminar Cita Seleccionada", fg_color="#D32F2F", hover_color="#C62828", command=eliminar_cita).pack(anchor="w")
+ctk.CTkButton(frame_lista_agenda, text="❌ Cancelar Cita Seleccionada", fg_color="#D32F2F", command=eliminar_cita).pack(anchor="w")
 
 # --------------------------------------------------------
 # VISTA: ADMINISTRACIÓN DE ASESORES
 # --------------------------------------------------------
 def guardar_asesor():
     if not txt_nom_as.get().strip(): return
-    with sqlite3.connect(DB) as conn:
+    with conectar_bd() as conn:
         cursor = conn.cursor()
         cursor.execute("INSERT INTO asesores (nombre, telefono, correo, activo) VALUES (?,?,?,1)",
                        (txt_nom_as.get().strip(), txt_tel_as.get().strip(), txt_cor_as.get().strip()))
@@ -597,7 +647,7 @@ def guardar_asesor():
 def borrar_asesor_seleccionado():
     seleccion = tree_asesores.selection()
     if not seleccion:
-        messagebox.showwarning("Selección vacía", "Por favor, selecciona un asesor de la lista para poder eliminarlo.")
+        messagebox.showwarning("Selección vacía", "Por favor, selecciona un asesor de la lista.")
         return
     
     datos_asesor = tree_asesores.item(seleccion[0], "values")
@@ -605,26 +655,23 @@ def borrar_asesor_seleccionado():
     nombre_asesor = datos_asesor[1]
     
     if int(id_asesor) == 1:
-        messagebox.showerror("Error", "El 'Asesor General' es el sistema por defecto y no puede ser eliminado.")
+        messagebox.showerror("Error", "El 'Asesor General' es estructural del sistema y no se puede remover.")
         return
         
-    if messagebox.askyesno("Confirmar Eliminación", f"¿Estás seguro de que deseas dar de baja a {nombre_asesor}?\n\nNota: Sus clientes e inmuebles serán reasignados al Asesor General."):
-        with sqlite3.connect(DB) as conn:
+    if messagebox.askyesno("Confirmar Baja", f"¿Estás seguro de que deseas dar de baja a {nombre_asesor}?\n\nSus registros vinculados serán transferidos al Asesor General."):
+        with conectar_bd() as conn:
             cursor = conn.cursor()
-            # 1. Reasignar inmuebles de este asesor al Asesor General (ID 1)
             cursor.execute("UPDATE inmuebles SET id_asesor = 1 WHERE id_asesor = ?", (id_asesor,))
-            # 2. Reasignar clientes de este asesor al Asesor General (ID 1)
             cursor.execute("UPDATE clientes SET id_asesor = 1 WHERE id_asesor = ?", (id_asesor,))
-            # 3. Desactivar lógicamente al asesor
             cursor.execute("UPDATE asesores SET activo = 0 WHERE id_asesor = ?", (id_asesor,))
             conn.commit()
             
-        messagebox.showinfo("Baja Exitosa", f"El asesor {nombre_asesor} ha sido dado de baja y sus cuentas transferidas.")
+        messagebox.showinfo("Baja Exitosa", f"El asesor {nombre_asesor} ha sido desactivado sin comprometer la integridad referencial.")
         actualizar_tabla_asesores()
 
 def actualizar_tabla_asesores():
     for item in tree_asesores.get_children(): tree_asesores.delete(item)
-    with sqlite3.connect(DB) as conn:
+    with conectar_bd() as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT id_asesor, nombre, telefono, correo FROM asesores WHERE activo = 1")
         for r in cursor.fetchall(): tree_asesores.insert("", "end", values=r)
@@ -642,24 +689,28 @@ tree_asesores = ttk.Treeview(frame_asesores, columns=("ID", "NOMBRE", "TELEFONO"
 for col in ("ID", "NOMBRE", "TELEFONO", "CORREO"): tree_asesores.heading(col, text=col)
 tree_asesores.pack(fill="both", expand=True, padx=20, pady=10)
 
-# BOTÓN DE ACCIÓN AGREGADO: BORRAR ASESOR SELECCIONADO
-ctk.CTkButton(frame_asesores, text="❌ Dar de Baja Asesor Seleccionado", fg_color="#D32F2F", hover_color="#C62828", command=borrar_asesor_seleccionado).pack(anchor="w", padx=20, pady=(0, 20))
+ctk.CTkButton(frame_asesores, text="❌ Dar de Baja Asesor Seleccionado", fg_color="#D32F2F", command=borrar_asesor_seleccionado).pack(anchor="w", padx=20, pady=(0, 20))
 
 # --------------------------------------------------------
 # VISTA: PAPELERA DE RECICLAJE
 # --------------------------------------------------------
 def actualizar_tabla_papelera():
     for item in tree_papelera.get_children(): tree_papelera.delete(item)
-    with sqlite3.connect(DB) as conn:
+    with conectar_bd() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT id_inmueble, titulo, precio, colonia FROM inmuebles WHERE eliminado = 1")
+        cursor.execute("""
+            SELECT i.id_inmueble, i.titulo, i.precio, u.colonia 
+            FROM inmuebles i 
+            JOIN ubicaciones u ON i.id_ubicacion = u.id_ubicacion 
+            WHERE i.eliminado = 1
+        """)
         for r in cursor.fetchall(): tree_papelera.insert("", "end", values=r)
 
 def restaurar_inmueble():
     sel = tree_papelera.selection()
     if not sel: return
     id_i = tree_papelera.item(sel[0], "values")[0]
-    with sqlite3.connect(DB) as conn:
+    with conectar_bd() as conn:
         cursor = conn.cursor()
         cursor.execute("UPDATE inmuebles SET eliminado = 0 WHERE id_inmueble = ?", (id_i,))
         conn.commit()
@@ -674,7 +725,7 @@ for col in ("ID", "TITULO", "PRECIO", "COLONIA"): tree_papelera.heading(col, tex
 tree_papelera.pack(fill="both", expand=True, padx=20, pady=15)
 
 # --------------------------------------------------------
-# VENTANA DINÁMICA: INVENTARIO ACTIVO
+# VENTANA DINÁMICA: INVENTARIO ACTIVO CON JOIN UBICACIÓN
 # --------------------------------------------------------
 def mostrar_inmuebles():
     global ventana_inventario
@@ -713,12 +764,13 @@ def mostrar_inmuebles():
         except ValueError:
             precio_f = 999999999.0
 
-        with sqlite3.connect(DB) as conn:
+        with conectar_bd() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT id_inmueble, tipo_operacion, tipo_inmueble, titulo, precio, colonia 
-                FROM inmuebles 
-                WHERE eliminado = 0 AND colonia LIKE ? AND precio <= ?
+                SELECT i.id_inmueble, i.tipo_operacion, i.tipo_inmueble, i.titulo, i.precio, u.colonia 
+                FROM inmuebles i 
+                JOIN ubicaciones u ON i.id_ubicacion = u.id_ubicacion
+                WHERE i.eliminado = 0 AND u.colonia LIKE ? AND i.precio <= ?
             """, (colonia_f, precio_f))
             for row in cursor.fetchall(): tree.insert("", "end", values=row)
 
@@ -730,7 +782,7 @@ def mostrar_inmuebles():
         if not seleccion: return
         id_inmueble = tree.item(seleccion[0], "values")[0]
         if messagebox.askyesno("Confirmar", f"¿Mover la propiedad #{id_inmueble} a la papelera?"):
-            with sqlite3.connect(DB) as conn:
+            with conectar_bd() as conn:
                 cursor = conn.cursor()
                 cursor.execute("UPDATE inmuebles SET eliminado = 1 WHERE id_inmueble = ?", (id_inmueble,))
                 conn.commit()
@@ -748,9 +800,14 @@ def mostrar_inmuebles():
         ventana_edit.geometry("500x780")
         ventana_edit.after(100, lambda: ventana_edit.focus())
 
-        with sqlite3.connect(DB) as conn:
+        with conectar_bd() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT titulo, precio, colonia, municipio, descripcion, m2_terreno, m2_construccion, tipo_operacion, tipo_inmueble, estado FROM inmuebles WHERE id_inmueble=?", (id_inmueble,))
+            cursor.execute("""
+                SELECT i.titulo, i.precio, u.colonia, u.municipio, i.descripcion, i.m2_terreno, i.m2_construccion, i.tipo_operacion, i.tipo_inmueble, u.estado 
+                FROM inmuebles i
+                JOIN ubicaciones u ON i.id_ubicacion = u.id_ubicacion
+                WHERE i.id_inmueble=?
+            """, (id_inmueble,))
             reg = cursor.fetchone()
 
         ctk.CTkLabel(ventana_edit, text="Título Comercial").pack()
@@ -773,7 +830,7 @@ def mostrar_inmuebles():
             if not seleccion_fotos: return
             carpeta = f"fotos/inmueble_{id_inmueble}"
             os.makedirs(carpeta, exist_ok=True)
-            with sqlite3.connect(DB) as conn:
+            with conectar_bd() as conn:
                 cursor = conn.cursor()
                 for f in seleccion_fotos:
                     dest = os.path.join(carpeta, os.path.basename(f))
@@ -792,7 +849,7 @@ def mostrar_inmuebles():
                 scroll = ctk.CTkScrollableFrame(ventana_fotos, width=800, height=550)
                 scroll.pack(fill="both", expand=True)
                 
-                with sqlite3.connect(DB) as conn:
+                with conectar_bd() as conn:
                     cursor = conn.cursor()
                     cursor.execute("SELECT id_foto, ruta_archivo, principal FROM fotos_inmueble WHERE id_inmueble=? ORDER BY principal DESC", (id_inmueble,))
                     fotos = cursor.fetchall()
@@ -816,27 +873,23 @@ def mostrar_inmuebles():
                     ctk.CTkLabel(f_marco, text=lbl_txt).pack()
 
                     def hacer_p(f_id=id_f):
-                        with sqlite3.connect(DB) as cn:
+                        with conectar_bd() as cn:
                             cr = cn.cursor()
                             cr.execute("UPDATE fotos_inmueble SET principal=0 WHERE id_inmueble=?", (id_inmueble,))
                             cr.execute("UPDATE fotos_inmueble SET principal=1 WHERE id_foto=?", (f_id,))
                         renderizar_galeria()
 
                     def borrar_foto(f_id=id_f, archivo_ruta=ruta):
-                        if messagebox.askyesno("Confirmar", "¿Seguro que deseas eliminar permanentemente esta fotografía de la galería?", parent=ventana_fotos):
-                            try:
-                                with sqlite3.connect(DB) as cn:
-                                    cr = cn.cursor()
-                                    cr.execute("DELETE FROM fotos_inmueble WHERE id_foto=?", (f_id,))
-                                    cn.commit()
-                                if os.path.exists(archivo_ruta):
-                                    os.remove(archivo_ruta)
-                            except Exception as e:
-                                messagebox.showerror("Error", f"No se pudo eliminar el archivo físico: {e}", parent=ventana_fotos)
+                        if messagebox.askyesno("Confirmar", "¿Seguro que deseas eliminar esta fotografía?", parent=ventana_fotos):
+                            with conectar_bd() as cn:
+                                cr = cn.cursor()
+                                cr.execute("DELETE FROM fotos_inmueble WHERE id_foto=?", (f_id,))
+                                cn.commit()
+                            if os.path.exists(archivo_ruta): os.remove(archivo_ruta)
                             renderizar_galeria()
 
                     ctk.CTkButton(f_marco, text="Principal", width=120, height=24, command=hacer_p).pack(pady=2)
-                    ctk.CTkButton(f_marco, text="❌ Eliminar", fg_color="#D32F2F", hover_color="#C62828", width=120, height=24, command=borrar_foto).pack(pady=2)
+                    ctk.CTkButton(f_marco, text="❌ Eliminar", fg_color="#D32F2F", width=120, height=24, command=borrar_foto).pack(pady=2)
                     
                     c += 1
                     if c >= 4: c=0; r+=1
@@ -847,18 +900,18 @@ def mostrar_inmuebles():
             doc = SimpleDocTemplate(archivo_pdf, pagesize=(612, 792), rightMargin=40, leftMargin=40, topMargin=40, bottomMargin=40)
             styles = getSampleStyleSheet()
             
-            estilo_titulo = ParagraphStyle('T1', fontName='Helvetica-Bold', fontSize=24, textColor=colors.HexColor('#1A237E'), spaceAfter=15)
+            estilo_titulo = ParagraphStyle('T1', fontName='Helvetica-Bold', fontSize=24, textColor=colors.HexColor('#1A237E'), spaceAfter=4)
             estilo_sub = ParagraphStyle('T2', fontName='Helvetica-Bold', fontSize=12, textColor=colors.HexColor('#5C6BC0'), spaceAfter=15)
             estilo_normal = ParagraphStyle('N', fontName='Helvetica', fontSize=10, leading=14)
             estilo_negrita = ParagraphStyle('B', fontName='Helvetica-Bold', fontSize=10, leading=14, textColor=colors.HexColor('#1A237E'))
 
             elementos = [
-                Paragraph("<b>GARANZIA INMOBILIARIA</b>", estilo_titulo),
+                Paragraph("<b>GARANZIA REAL ESTATE</b>", estilo_titulo),
                 Paragraph(f"Ficha Comercial Avanzada — ID Ref: #{id_inmueble}", estilo_sub),
                 Spacer(1, 10)
             ]
 
-            with sqlite3.connect(DB) as conn:
+            with conectar_bd() as conn:
                 cursor = conn.cursor()
                 cursor.execute("SELECT ruta_archivo FROM fotos_inmueble WHERE id_inmueble=? ORDER BY principal DESC LIMIT 1", (id_inmueble,))
                 res_f = cursor.fetchone()
@@ -888,16 +941,17 @@ def mostrar_inmuebles():
             ]))
             elementos.append(t)
             doc.build(elementos)
-            messagebox.showinfo("PDF Creado", f"Guardado con éxito en: {archivo_pdf}")
+            messagebox.showinfo("PDF Creado", f"Guardado en: {archivo_pdf}")
 
         def actualizar_inmueble():
-            with sqlite3.connect(DB) as conn:
+            id_ub_nueva = obtener_o_crear_ubicacion(txt_colonia_edit.get(), txt_municipio_edit.get(), reg[9])
+            with conectar_bd() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
                     UPDATE inmuebles 
-                    SET titulo=?, precio=?, colonia=?, municipio=?, descripcion=?, m2_terreno=?, m2_construccion=? 
+                    SET titulo=?, precio=?, id_ubicacion=?, descripcion=?, m2_terreno=?, m2_construccion=? 
                     WHERE id_inmueble=?
-                """, (txt_titulo_edit.get(), float(txt_precio_edit.get()), txt_colonia_edit.get(), txt_municipio_edit.get(), txt_desc_edit.get(), float(txt_m2t_edit.get()), float(txt_m2c_edit.get()), id_inmueble))
+                """, (txt_titulo_edit.get(), float(txt_precio_edit.get()), id_ub_nueva, txt_desc_edit.get(), float(txt_m2t_edit.get()), float(txt_m2c_edit.get()), id_inmueble))
                 conn.commit()
             messagebox.showinfo("Modificado", "Datos del inmueble actualizados con éxito.")
             ventana_edit.destroy()
@@ -906,7 +960,7 @@ def mostrar_inmuebles():
         ctk.CTkButton(ventana_edit, text="➕ Cargar Fotos", command=agregar_fotos_local, fg_color="#43A047").pack(pady=3)
         ctk.CTkButton(ventana_edit, text="🖼️ Ver Galería", command=ver_fotos, fg_color="#E65100").pack(pady=3)
         ctk.CTkButton(ventana_edit, text="📄 PDF Ficha Premium", command=generar_pdf_premium, fg_color="#1A237E").pack(pady=3)
-        ctk.CTkButton(ventana_edit, text="💾 Guardar Cambios", command=actualizar_inmueble, fg_color="#2E7D32").pack(pady=50)
+        ctk.CTkButton(ventana_edit, text="💾 Guardar Cambios", command=actualizar_inmueble, fg_color="#2E7D32").pack(pady=12)
 
     tree.bind("<Double-1>", editar_inmueble)
 
