@@ -1,971 +1,927 @@
 import os
 import shutil
-import sqlite3
+import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-from datetime import datetime
-
+from tkinter import ttk, messagebox, filedialog
 import customtkinter as ctk
-from PIL import Image as PILImage
-from PIL import ImageTk
-
-# Librería para el Calendario Visual
+from PIL import Image as PILImage, ImageTk
 from tkcalendar import Calendar
 
-# ReportLab para la ficha PDF Premium
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.platypus import Paragraph, Spacer, SimpleDocTemplate, Table, TableStyle
-from reportlab.platypus import Image as RLImage
-from reportlab.lib import colors
+import database_manager as db
+import pdf_generator
 
-ctk.set_appearance_mode("light")
+ctk.set_appearance_mode("Light")
 ctk.set_default_color_theme("blue")
 
-DB = "database/inmobiliaria.db"
-
-# Asegurar directorios de trabajo
-os.makedirs("database", exist_ok=True)
-os.makedirs("fotos", exist_ok=True)
-os.makedirs("pdfs", exist_ok=True)
-
-# Variables de control para ventanas únicas y widgets globales
-ventana_inventario = None
-ventana_cartera = None
-combo_asesor_inm = None
-combo_asesor_cli = None
-
-# --------------------------------------------------------
-# BASE DE DATOS: CONEXIÓN INTEGRAL CON LLAVES FORÁNEAS
-# --------------------------------------------------------
-def conectar_bd():
-    """Establece conexión con la BD y fuerza la integridad referencial."""
-    conn = sqlite3.connect(DB)
-    conn.execute("PRAGMA foreign_keys = ON;")
-    return conn
-
-def inicializar_bd():
-    with conectar_bd() as conn:
-        cursor = conn.cursor()
+class SistemaInmobiliarioApp(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title("GRUPO GARANZIA INMOBILIARIA")
+        self.geometry("1250x780")
         
-        # 1. Tabla de Asesores
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS asesores (
-                id_asesor INTEGER PRIMARY KEY AUTOINCREMENT,
-                nombre TEXT NOT NULL,
-                telefono TEXT,
-                correo TEXT,
-                activo INTEGER DEFAULT 1 CHECK(activo IN (0, 1))
-            )
-        """)
+        self.ventana_inventario = None
+        self.rutas_fotos_temporales = []
         
-        # 2. Catálogo Normalizado de Ubicaciones
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS ubicaciones (
-                id_ubicacion INTEGER PRIMARY KEY AUTOINCREMENT,
-                colonia TEXT NOT NULL,
-                municipio TEXT NOT NULL,
-                estado TEXT NOT NULL,
-                UNIQUE(colonia, municipio, estado)
-            )
-        """)
+        # UI Base Layout Novedoso Anteriores
+        self.sidebar = ctk.CTkFrame(self, width=250, corner_radius=0, fg_color="#1A237E")
+        self.sidebar.pack(side="left", fill="y")
         
-        # 3. Tabla de Inmuebles Mejorada (CHECKs, Auditoría y Llaves Foráneas estrictas)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS inmuebles (
-                id_inmueble INTEGER PRIMARY KEY AUTOINCREMENT,
-                tipo_operacion TEXT NOT NULL CHECK(tipo_operacion IN ('VENTA', 'RENTA')),
-                tipo_inmueble TEXT NOT NULL CHECK(tipo_inmueble IN ('Casa', 'Departamento', 'Terreno', 'Local', 'Oficina')),
-                titulo TEXT NOT NULL,
-                precio REAL NOT NULL CHECK(precio >= 0),
-                id_ubicacion INTEGER NOT NULL,
-                descripcion TEXT,
-                m2_terreno REAL DEFAULT 0.0,
-                m2_construccion REAL DEFAULT 0.0,
-                id_asesor INTEGER NOT NULL,
-                eliminado INTEGER DEFAULT 0 CHECK(eliminado IN (0, 1)),
-                fecha_registro TEXT DEFAULT (datetime('now', 'localtime')),
-                FOREIGN KEY(id_asesor) REFERENCES asesores(id_asesor) ON DELETE RESTRICT,
-                FOREIGN KEY(id_ubicacion) REFERENCES ubicaciones(id_ubicacion)
-            )
-        """)
+        ctk.CTkLabel(self.sidebar, text="GRUPO GARANZIA", font=("Arial", 18, "bold"), text_color="white").pack(pady=30)
         
-        # 4. Tabla de Fotos de Inmuebles
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS fotos_inmueble (
-                id_foto INTEGER PRIMARY KEY AUTOINCREMENT,
-                id_inmueble INTEGER NOT NULL,
-                ruta_archivo TEXT NOT NULL,
-                descripcion TEXT,
-                principal INTEGER DEFAULT 0 CHECK(principal IN (0, 1)),
-                FOREIGN KEY(id_inmueble) REFERENCES inmuebles(id_inmueble) ON DELETE CASCADE
-            )
-        """)
+        ctk.CTkButton(self.sidebar, text="🏠 Alta de Inmueble", fg_color="transparent", text_color="white", anchor="w", command=lambda: self.conmutar_panel(self.frame_alta_inm)).pack(fill="x", padx=15, pady=5)
+        ctk.CTkButton(self.sidebar, text="🔍 Inventario Inmuebles", fg_color="transparent", text_color="white", anchor="w", command=self.mostrar_inventario).pack(fill="x", padx=15, pady=5) 
+        ctk.CTkButton(self.sidebar, text="👥 Registro Prospectos", fg_color="transparent", text_color="white", anchor="w", command=lambda: self.conmutar_panel(self.frame_alta_clientes)).pack(fill="x", padx=15, pady=5)
+        ctk.CTkButton(self.sidebar, text="📈 Prospectos activos", fg_color="transparent", text_color="white", anchor="w", command=self.mostrar_buscador_prospectos).pack(fill="x", padx=15, pady=5)
+        ctk.CTkButton(self.sidebar, text="💼 Control de Asesores", fg_color="transparent", text_color="white", anchor="w", command=lambda: [self.conmutar_panel(self.frame_asesores), self.actualizar_tabla_asesores()]).pack(fill="x", padx=15, pady=5)
+        ctk.CTkButton(self.sidebar, text="📅 Agenda de Visitas", fg_color="transparent", text_color="white", anchor="w", command=lambda: [self.conmutar_panel(self.frame_agenda), self.actualizar_agenda_datos()]).pack(fill="x", padx=15, pady=5)
+        ctk.CTkButton(self.sidebar, text="🗑️ Papelera", fg_color="transparent", text_color="white", anchor="w", command=lambda: [self.conmutar_panel(self.frame_papelera), self.actualizar_tabla_papelera()]).pack(fill="x", padx=15, pady=5)
+
+        self.contenedor_principal = ctk.CTkFrame(self, fg_color="#F5F5F5", corner_radius=0)
+        self.contenedor_principal.pack(side="right", fill="both", expand=True)
         
-        # 5. Tabla de Clientes con Auditoría
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS clientes (
-                id_cliente INTEGER PRIMARY KEY AUTOINCREMENT,
-                nombre TEXT NOT NULL,
-                telefono TEXT,
-                correo TEXT,
-                presupuesto_max REAL DEFAULT 0.0,
-                id_ubicacion_interes INTEGER,
-                tipo_buscado TEXT CHECK(tipo_buscado IN ('Casa', 'Departamento', 'Terreno', 'Local', 'Oficina')),
-                operacion_buscada TEXT DEFAULT 'VENTA' CHECK(operacion_buscada IN ('VENTA', 'RENTA')),
-                m2_minimos REAL DEFAULT 0.0,
-                id_asesor INTEGER NOT NULL,
-                fecha_registro TEXT DEFAULT (datetime('now', 'localtime')),
-                FOREIGN KEY(id_asesor) REFERENCES asesores(id_asesor) ON DELETE RESTRICT,
-                FOREIGN KEY(id_ubicacion_interes) REFERENCES ubicaciones(id_ubicacion)
-            )
-        """)
+        self.crear_paneles_arquitectura()
+        self.conmutar_panel(self.frame_alta_inm)
+
+    def conmutar_panel(self, panel):
+        for p in [self.frame_alta_inm, self.frame_alta_clientes, self.frame_asesores, self.frame_agenda, self.frame_papelera]:
+            p.pack_forget()
+        panel.pack(fill="both", expand=True, padx=25, pady=25)
+
+    def crear_paneles_arquitectura(self):
+        # ---------------------------------------------------------------------
+        # CORRECCIÓN SOLUCIÓN 4: SCROLLBAR COMPLETAMENTE FUNCIONAL
+        # ---------------------------------------------------------------------
+        self.frame_alta_inm = ctk.CTkScrollableFrame(self.contenedor_principal, fg_color="transparent")
         
-        # 6. Tabla de Citas Robustecida (Evita Overbooking en la misma propiedad y añade Estados)
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS citas (
-                id_cita INTEGER PRIMARY KEY AUTOINCREMENT,
-                id_cliente INTEGER NOT NULL,
-                id_inmueble INTEGER NOT NULL,
-                fecha_hora TEXT NOT NULL, -- Formato: YYYY-MM-DD HH:MM
-                estado TEXT DEFAULT 'Pendiente' CHECK(estado IN ('Pendiente', 'Realizada', 'Cancelada')),
-                notas TEXT,
-                FOREIGN KEY(id_cliente) REFERENCES clientes(id_cliente) ON DELETE CASCADE,
-                FOREIGN KEY(id_inmueble) REFERENCES inmuebles(id_inmueble) ON DELETE CASCADE,
-                UNIQUE(id_inmueble, fecha_hora)
-            )
-        """)
-
-        # Índices de optimización para búsquedas veloces
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_inmuebles_busqueda ON inmuebles (tipo_inmueble, precio, eliminado);")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_clientes_busqueda ON clientes (tipo_buscado, presupuesto_max);")
-
-        # Asegurar el Asesor por defecto
-        cursor.execute("SELECT COUNT(*) FROM asesores")
-        if cursor.fetchone()[0] == 0:
-            cursor.execute("INSERT INTO asesores (nombre, telefono, correo, activo) VALUES ('Asesor General', '5500000000', 'general@garanzia.com', 1)")
+        frame_interior = ctk.CTkFrame(self.frame_alta_inm, fg_color="white", corner_radius=12, border_width=1, border_color="#E0E0E0")
+        frame_interior.pack(fill="both", expand=True, padx=10, pady=10)
         
-        conn.commit()
-
-inicializar_bd()
-
-# --------------------------------------------------------
-# FUNCIONES DE CONTROL DE UBICACIONES (NORMALIZACIÓN)
-# --------------------------------------------------------
-def obtener_o_crear_ubicacion(colonia, municipio, estado):
-    """Busca una ubicación exacta. Si no existe, la crea limpia."""
-    col = colonia.strip().title()
-    mun = municipio.strip().title()
-    est = estado.strip().title()
-    
-    with conectar_bd() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id_ubicacion FROM ubicaciones WHERE colonia=? AND municipio=? AND estado=?", (col, mun, est))
-        res = cursor.fetchone()
-        if res:
-            return res[0]
-        else:
-            cursor.execute("INSERT INTO ubicaciones (colonia, municipio, estado) VALUES (?,?,?)", (col, mun, est))
-            conn.commit()
-            return cursor.lastrowid
-
-# --------------------------------------------------------
-# FUNCIONES DE UTILIDAD (DROPDOWNS Y ASESORES)
-# --------------------------------------------------------
-def obtener_lista_asesores():
-    with conectar_bd() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT nombre FROM asesores WHERE activo = 1")
-        return [row[0] for row in cursor.fetchall()]
-
-def obtener_lista_clientes_combo():
-    with conectar_bd() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id_cliente, nombre FROM clientes")
-        return [f"{row[0]} - {row[1]}" for row in cursor.fetchall()]
-
-def obtener_lista_inmuebles_combo():
-    with conectar_bd() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id_inmueble, titulo FROM inmuebles WHERE eliminado = 0")
-        return [f"{row[0]} - {row[1]}" for row in cursor.fetchall()]
-
-def actualizar_combos_asesores():
-    lista = obtener_lista_asesores()
-    if combo_asesor_inm and combo_asesor_inm.winfo_exists():
-        combo_asesor_inm.configure(values=lista)
-        combo_asesor_inm.set(lista[0] if lista else "Seleccionar Asesor...")
-    if combo_asesor_cli and combo_asesor_cli.winfo_exists():
-        combo_asesor_cli.configure(values=lista)
-        combo_asesor_cli.set(lista[0] if lista else "Seleccionar Asesor...")
-
-def obtener_id_asesor_por_nombre(nombre_asesor):
-    with conectar_bd() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id_asesor FROM asesores WHERE nombre = ?", (nombre_asesor,))
-        res = cursor.fetchone()
-        return res[0] if res else 1
-
-# --------------------------------------------------------
-# LÓGICA DE CRUCE / MATCH AUTOMÁTICO INDEPENDIENTE DE TEXTO
-# --------------------------------------------------------
-def calcular_y_mostrar_match(tipo_buscado, presupuesto_max, id_ubicacion_interes, nombre_cliente):
-    ventana_match = ctk.CTkToplevel(app)
-    ventana_match.title(f"Coincidencias de Inventario para: {nombre_cliente}")
-    ventana_match.geometry("900x450")
-    ventana_match.after(100, lambda: ventana_match.focus())
-
-    ctk.CTkLabel(ventana_match, text=f"Propiedades encontradas para {nombre_cliente}", font=("Arial", 16, "bold"), text_color="#1A237E").pack(pady=10)
-
-    frame_tabla_match = ctk.CTkFrame(ventana_match)
-    frame_tabla_match.pack(fill="both", expand=True, padx=15, pady=15)
-
-    columnas = ("ID", "OPERACIÓN", "TIPO", "TÍTULO", "PRECIO", "COLONIA", "MUNICIPIO")
-    tree_match = ttk.Treeview(frame_tabla_match, columns=columnas, show="headings")
-    for col in columnas: 
-        tree_match.heading(col, text=col)
-        tree_match.column(col, width=110, anchor="center")
-    tree_match.pack(side="left", fill="both", expand=True)
-
-    with conectar_bd() as conn:
-        cursor = conn.cursor()
-        # El Match ahora es robusto gracias a la relación directa con id_ubicacion
-        cursor.execute("""
-            SELECT i.id_inmueble, i.tipo_operacion, i.tipo_inmueble, i.titulo, i.precio, u.colonia, u.municipio 
-            FROM inmuebles i
-            JOIN ubicaciones u ON i.id_ubicacion = u.id_ubicacion
-            WHERE i.eliminado = 0 
-              AND i.tipo_inmueble = ? 
-              AND i.precio <= ? 
-              AND i.id_ubicacion = ?
-        """, (tipo_buscado, presupuesto_max, id_ubicacion_interes))
+        ctk.CTkLabel(frame_interior, text="Registro de Nuevo Inmueble", font=("Arial", 20, "bold"), text_color="#1A237E").pack(pady=15, padx=20, anchor="w")
         
-        filas = cursor.fetchall()
-        for r in filas: 
-            tree_match.insert("", "end", values=r)
+        def crear_bloque_campo(parent, texto):
+            f = ctk.CTkFrame(parent, fg_color="transparent")
+            f.pack(fill="x", padx=20, pady=4)
+            lbl = ctk.CTkLabel(f, text=texto, font=("Arial", 12, "bold"), width=150, anchor="w")
+            lbl.pack(side="left")
+            return f
 
-    if not filas:
-        messagebox.showinfo("Sin Coincidencias", "No se encontraron propiedades exactas en la misma colonia elegida por el momento.", parent=ventana_match)
-
-# --------------------------------------------------------
-# VENTANA PRINCIPAL Y CONFIGURACIÓN DE NAVEGACIÓN
-# --------------------------------------------------------
-app = ctk.CTk()
-app.title("CRM Inmobiliario Garanzia v3.0 Normalizado")
-app.geometry("1350x850")
-
-frame_dashboard = ctk.CTkFrame(app, corner_radius=0, fg_color="#F5F5F5")
-frame_alta_inmuebles = ctk.CTkFrame(app, corner_radius=0, fg_color="transparent")
-frame_alta_clientes = ctk.CTkFrame(app, corner_radius=0, fg_color="transparent")
-frame_agenda = ctk.CTkFrame(app, corner_radius=0, fg_color="#F5F5F5") 
-frame_asesores = ctk.CTkFrame(app, corner_radius=0, fg_color="#F5F5F5")
-frame_papelera = ctk.CTkFrame(app, corner_radius=0, fg_color="#F5F5F5")
-
-def cambiar_vista(vista_destino):
-    frame_dashboard.pack_forget()
-    frame_alta_inmuebles.pack_forget()
-    frame_alta_clientes.pack_forget()
-    frame_agenda.pack_forget()
-    frame_asesores.pack_forget()
-    frame_papelera.pack_forget()
-    
-    if vista_destino == frame_dashboard:
-        actualizar_metricas_dashboard()
-    elif vista_destino in (frame_alta_inmuebles, frame_alta_clientes):
-        actualizar_combos_asesores()
-    elif vista_destino == frame_agenda:
-        actualizar_componentes_agenda()
-    elif vista_destino == frame_asesores:
-        actualizar_tabla_asesores()
-    elif vista_destino == frame_papelera:
-        actualizar_tabla_papelera()
+        # Formulario Estilo Original Asegurado
+        self.cmb_op = ctk.CTkComboBox(crear_bloque_campo(frame_interior, "Tipo Operación:"), values=["VENTA", "RENTA"], width=280)
+        self.cmb_op.pack(side="left")
         
-    vista_destino.pack(side="right", fill="both", expand=True)
+        self.cmb_tipo = ctk.CTkComboBox(crear_bloque_campo(frame_interior, "Tipo Inmueble:"), values=["Casa", "Departamento", "Terreno", "Local", "Oficina"], width=280)
+        self.cmb_tipo.pack(side="left")
 
-# Menú Lateral Fijo
-menu = ctk.CTkFrame(app, width=240, corner_radius=0, fg_color="#1A237E")
-menu.pack(side="left", fill="y")
-
-ctk.CTkLabel(menu, text="GARANZIA", font=("Arial", 24, "bold"), text_color="white").pack(pady=(30, 2))
-ctk.CTkLabel(menu, text="CRM INMOBILIARIO", font=("Arial", 11, "italic"), text_color="#B0BEC5").pack(pady=(0, 35))
-
-estilo_btn = {"fg_color": "transparent", "text_color": "white", "hover_color": "#283593", "anchor": "w", "height": 40}
-
-ctk.CTkButton(menu, text="📊 Dashboard / Inicio", command=lambda: cambiar_vista(frame_dashboard), **estilo_btn).pack(fill="x", padx=15, pady=3)
-ctk.CTkButton(menu, text="🏠 Alta de Inmuebles", command=lambda: cambiar_vista(frame_alta_inmuebles), **estilo_btn).pack(fill="x", padx=15, pady=3)
-ctk.CTkButton(menu, text="📂 Ver Inventario", command=lambda: mostrar_inmuebles(), **estilo_btn).pack(fill="x", padx=15, pady=3)
-ctk.CTkButton(menu, text="👤 Registrar Cliente", command=lambda: cambiar_vista(frame_alta_clientes), **estilo_btn).pack(fill="x", padx=15, pady=3)
-ctk.CTkButton(menu, text="👥 Cartera de Clientes", command=lambda: mostrar_clientes(), **estilo_btn).pack(fill="x", padx=15, pady=3)
-ctk.CTkButton(menu, text="📅 Agenda de Citas", command=lambda: cambiar_vista(frame_agenda), **estilo_btn).pack(fill="x", padx=15, pady=3)
-ctk.CTkButton(menu, text="💼 Administrar Asesores", command=lambda: cambiar_vista(frame_asesores), **estilo_btn).pack(fill="x", padx=15, pady=3)
-ctk.CTkButton(menu, text="🗑️ Papelera de Reciclaje", command=lambda: cambiar_vista(frame_papelera), **estilo_btn).pack(fill="x", padx=15, pady=3)
-
-# --------------------------------------------------------
-# VISTA: DASHBOARD PANELS
-# --------------------------------------------------------
-contenedor_tarjetas = ctk.CTkFrame(frame_dashboard, fg_color="transparent")
-contenedor_tarjetas.pack(fill="x", padx=30, pady=10)
-
-def crear_tarjeta_kpi(master, titulo, color_borde):
-    f = ctk.CTkFrame(master, width=280, height=120, corner_radius=10, border_width=2, border_color=color_borde, fg_color="white")
-    f.pack_propagate(False)
-    f.pack(side="left", padx=10)
-    ctk.CTkLabel(f, text=titulo, font=("Arial", 12, "bold"), text_color="gray").pack(pady=(15, 2))
-    lbl_val = ctk.CTkLabel(f, text="0", font=("Arial", 18, "bold"), text_color="black")
-    lbl_val.pack()
-    return lbl_val
-
-ctk.CTkLabel(frame_dashboard, text="Panel de Control General", font=("Arial", 28, "bold"), text_color="#1A237E").pack(pady=(25, 20), padx=30, anchor="w")
-lbl_kpi_inmuebles = crear_tarjeta_kpi(contenedor_tarjetas, "PROPIEDADES EN INVENTARIO", "#1E88E5")
-lbl_kpi_clientes = crear_tarjeta_kpi(contenedor_tarjetas, "CLIENTES ACTIVOS", "#43A047")
-lbl_kpi_valor = crear_tarjeta_kpi(contenedor_tarjetas, "VALOR ACTIVO DEL PORTAFOLIO", "#E65100")
-
-contenedor_detalles = ctk.CTkFrame(frame_dashboard, fg_color="white", corner_radius=10)
-contenedor_detalles.pack(fill="both", expand=True, padx=40, pady=25)
-
-lbl_sub_promedio = ctk.CTkLabel(contenedor_detalles, text="📊 Valor Promedio: $0.00", font=("Arial", 14), text_color="black")
-lbl_sub_promedio.pack(pady=5, padx=20, anchor="w")
-lbl_sub_citas = ctk.CTkLabel(contenedor_detalles, text="📅 Agenda: 0 hoy", font=("Arial", 14), text_color="black")
-lbl_sub_citas.pack(pady=5, padx=20, anchor="w")
-
-def actualizar_metricas_dashboard():
-    hoy_str = datetime.now().strftime("%Y-%m-%d")
-    filtro_fecha = hoy_str + "%"
-    
-    try:
-        with conectar_bd() as conn:
-            cursor = conn.cursor()
-            
-            cursor.execute("SELECT COUNT(*) FROM inmuebles WHERE eliminado = 0")
-            total_inm = cursor.fetchone()[0]
-            
-            cursor.execute("SELECT COUNT(*) FROM clientes")
-            total_cli = cursor.fetchone()[0]
-            
-            cursor.execute("SELECT SUM(precio) FROM inmuebles WHERE eliminado = 0")
-            valor_portafolio = cursor.fetchone()[0] or 0.0
-            
-            cursor.execute("SELECT AVG(precio) FROM inmuebles WHERE eliminado = 0")
-            promedio_prop = cursor.fetchone()[0] or 0.0
-            
-            cursor.execute("SELECT COUNT(*) FROM citas WHERE fecha_hora LIKE ?", (filtro_fecha,))
-            citas_hoy = cursor.fetchone()[0]
-
-            lbl_kpi_inmuebles.configure(text=f"Total: {total_inm}")
-            lbl_kpi_clientes.configure(text=str(total_cli))
-            lbl_kpi_valor.configure(text=f"${valor_portafolio:,.2f}")
-            lbl_sub_promedio.configure(text=f"📊 Valor Promedio de Propiedad: ${promedio_prop:,.2f}")
-            lbl_sub_citas.configure(text=f"📅 Agenda: {citas_hoy} citas agendadas para hoy")
-            
-    except sqlite3.Error as e:
-        print(f"--- [Aviso de Base de Datos] ---")
-        print(f"Error al inicializar métricas: {e}")
-        print(f"Si cambiaste la estructura de las tablas recientemente, recuerda borrar el archivo database/inmobiliaria.db para regenerarlo.")
-        print(f"---------------------------------")
+        self.txt_tit = ctk.CTkEntry(crear_bloque_campo(frame_interior, "Título Comercial:"), width=450)
+        self.txt_tit.pack(side="left")
         
-        # Muestra ceros de forma segura en la interfaz en lugar de romper el programa
-        lbl_kpi_inmuebles.configure(text="Total: 0")
-        lbl_kpi_clientes.configure(text="0")
-        lbl_kpi_valor.configure(text="$0.00")
-        lbl_sub_promedio.configure(text="📊 Valor Promedio de Propiedad: $0.00")
-        lbl_sub_citas.configure(text="📅 Agenda: 0 citas agendadas para hoy")
-
-# --------------------------------------------------------
-# VISTA: ALTA DE INMUEBLES
-# --------------------------------------------------------
-def guardar_inmueble():
-    if not txt_titulo.get().strip() or not txt_precio.get().strip() or not txt_colonia.get().strip():
-        messagebox.showwarning("Campos incompletos", "Título, Precio y Colonia son obligatorios.")
-        return
-    try:
-        precio = float(txt_precio.get().replace(",", "").replace("$", "").strip())
-        m2_t = float(txt_m2_terreno.get().strip()) if txt_m2_terreno.get() else 0.0
-        m2_c = float(txt_m2_construccion.get().strip()) if txt_m2_construccion.get() else 0.0
-    except ValueError:
-        messagebox.showerror("Error", "Inserta valores numéricos válidos.")
-        return
-
-    # Normalizar ubicación
-    id_ub = obtener_o_crear_ubicacion(txt_colonia.get(), txt_municipio.get(), txt_estado.get())
-    id_ase = obtener_id_asesor_por_nombre(combo_asesor_inm.get())
-    
-    with conectar_bd() as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO inmuebles (tipo_operacion, tipo_inmueble, titulo, precio, id_ubicacion, descripcion, m2_terreno, m2_construccion, id_asesor, eliminado)
-            VALUES (?,?,?,?,?,?,?,?,?,0)
-        """, (combo_operacion.get(), combo_tipo.get(), txt_titulo.get().strip(), precio, id_ub, txt_descripcion.get().strip(), m2_t, m2_c, id_ase))
-        conn.commit()
-    messagebox.showinfo("Éxito", "Inmueble añadido exitosamente a la base de datos.")
-    limpiar_inmueble()
-
-def limpiar_inmueble():
-    txt_titulo.delete(0, 'end'); txt_precio.delete(0, 'end'); txt_colonia.delete(0, 'end')
-    txt_municipio.delete(0, 'end'); txt_estado.delete(0, 'end'); txt_descripcion.delete(0, 'end')
-    txt_m2_terreno.delete(0, 'end'); txt_m2_construccion.delete(0, 'end')
-
-ctk.CTkLabel(frame_alta_inmuebles, text="Alta de Inmuebles", font=("Arial", 26, "bold")).pack(pady=15)
-combo_operacion = ctk.CTkComboBox(frame_alta_inmuebles, values=["VENTA", "RENTA"], width=400); combo_operacion.pack(pady=4)
-combo_tipo = ctk.CTkComboBox(frame_alta_inmuebles, values=["Casa", "Departamento", "Terreno", "Local", "Oficina"], width=400); combo_tipo.pack(pady=4)
-txt_titulo = ctk.CTkEntry(frame_alta_inmuebles, width=400, placeholder_text="Título Comercial"); txt_titulo.pack(pady=4)
-txt_precio = ctk.CTkEntry(frame_alta_inmuebles, width=400, placeholder_text="Precio Venta/Renta"); txt_precio.pack(pady=4)
-txt_colonia = ctk.CTkEntry(frame_alta_inmuebles, width=400, placeholder_text="Colonia"); txt_colonia.pack(pady=4)
-txt_municipio = ctk.CTkEntry(frame_alta_inmuebles, width=400, placeholder_text="Municipio / Alcaldía"); txt_municipio.pack(pady=4)
-txt_estado = ctk.CTkEntry(frame_alta_inmuebles, width=400, placeholder_text="Estado"); txt_estado.pack(pady=4)
-txt_descripcion = ctk.CTkEntry(frame_alta_inmuebles, width=400, placeholder_text="Descripción o Notas Internas"); txt_descripcion.pack(pady=4)
-txt_m2_terreno = ctk.CTkEntry(frame_alta_inmuebles, width=400, placeholder_text="M2 Terreno"); txt_m2_terreno.pack(pady=4)
-txt_m2_construccion = ctk.CTkEntry(frame_alta_inmuebles, width=400, placeholder_text="M2 Construcción"); txt_m2_construccion.pack(pady=4)
-combo_asesor_inm = ctk.CTkComboBox(frame_alta_inmuebles, values=[], width=400); combo_asesor_inm.pack(pady=4)
-
-ctk.CTkButton(frame_alta_inmuebles, text="💾 Guardar Inmueble", command=guardar_inmueble, fg_color="#1E88E5").pack(pady=15)
-
-# --------------------------------------------------------
-# VISTA: REGISTRAR CLIENTES
-# --------------------------------------------------------
-def guardar_cliente():
-    nombre_cli = txt_nombre_cli.get().strip()
-    colonia_cli = txt_zona_cli.get().strip()
-    tipo_interes = combo_tipo_buscado.get()
-
-    if not nombre_cli or not colonia_cli:
-        messagebox.showwarning("Campos vacíos", "El nombre y la colonia de interés son obligatorios.")
-        return
-    try:
-        presupuesto = float(txt_presupuesto.get().replace(",", "").replace("$", "").strip()) if txt_presupuesto.get() else 0.0
-    except ValueError:
-        messagebox.showerror("Error", "Por favor ingresa un presupuesto numérico válido.")
-        return
-
-    # Vinculación normalizada de ubicación
-    id_ub = obtener_o_crear_ubicacion(colonia_cli, "Por Definir", "Por Definir")
-    id_ase = obtener_id_asesor_por_nombre(combo_asesor_cli.get())
-    
-    with conectar_bd() as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO clientes (nombre, telefono, correo, presupuesto_max, id_ubicacion_interes, tipo_buscado, operacion_buscada, id_asesor)
-            VALUES (?, ?, ?, ?, ?, ?, 'VENTA', ?)
-        """, (nombre_cli, txt_tel_cli.get().strip(), txt_correo_cli.get().strip(), presupuesto, id_ub, tipo_interes, id_ase))
-        conn.commit()
+        self.txt_prc = ctk.CTkEntry(crear_bloque_campo(frame_interior, "Precio ($ MXN):"), width=280)
+        self.txt_prc.pack(side="left")
         
-    messagebox.showinfo("Éxito", f"¡Cliente registrado con éxito!\nEjecutando Cruce Estricto Relacional...")
-    calcular_y_mostrar_match(tipo_interes, presupuesto, id_ub, nombre_cli)
-    limpiar_cliente()
-
-def limpiar_cliente():
-    txt_nombre_cli.delete(0, 'end'); txt_tel_cli.delete(0, 'end'); txt_correo_cli.delete(0, 'end')
-    txt_presupuesto.delete(0, 'end'); txt_zona_cli.delete(0, 'end')
-
-ctk.CTkLabel(frame_alta_clientes, text="Registro de Nuevos Prospectos", font=("Arial", 26, "bold")).pack(pady=20)
-txt_nombre_cli = ctk.CTkEntry(frame_alta_clientes, width=400, placeholder_text="Nombre del Lead"); txt_nombre_cli.pack(pady=5)
-txt_tel_cli = ctk.CTkEntry(frame_alta_clientes, width=400, placeholder_text="Teléfono Celular"); txt_tel_cli.pack(pady=5)
-txt_correo_cli = ctk.CTkEntry(frame_alta_clientes, width=400, placeholder_text="Correo Electrónico"); txt_correo_cli.pack(pady=5)
-txt_presupuesto = ctk.CTkEntry(frame_alta_clientes, width=400, placeholder_text="Presupuesto Máximo de Compra"); txt_presupuesto.pack(pady=5)
-txt_zona_cli = ctk.CTkEntry(frame_alta_clientes, width=400, placeholder_text="Colonia Específica de interés"); txt_zona_cli.pack(pady=5)
-combo_tipo_buscado = ctk.CTkComboBox(frame_alta_clientes, values=["Casa", "Departamento", "Terreno", "Local", "Oficina"], width=400); combo_tipo_buscado.pack(pady=5)
-combo_asesor_cli = ctk.CTkComboBox(frame_alta_clientes, values=[], width=400); combo_asesor_cli.pack(pady=5)
-
-ctk.CTkButton(frame_alta_clientes, text="👥 Registrar Cliente", command=guardar_cliente, fg_color="#2E7D32").pack(pady=15)
-
-# --------------------------------------------------------
-# VISTA: CARTERA DE CLIENTES
-# --------------------------------------------------------
-def mostrar_clientes():
-    global ventana_cartera
-    if ventana_cartera is not None and ventana_cartera.winfo_exists():
-        ventana_cartera.focus()
-        return
-
-    ventana_cartera = ctk.CTkToplevel(app)
-    ventana_cartera.title("Cartera de Clientes Activos")
-    ventana_cartera.geometry("1050x580")
-    ventana_cartera.after(100, lambda: ventana_cartera.focus())
-
-    frame_acciones_cli = ctk.CTkFrame(ventana_cartera)
-    frame_acciones_cli.pack(fill="x", padx=15, pady=10)
-
-    frame_t = ctk.CTkFrame(ventana_cartera)
-    frame_t.pack(fill="both", expand=True, padx=15, pady=5)
-
-    columnas = ("ID", "NOMBRE", "TELEFONO", "CORREO", "PRESUPUESTO", "ID_UBICACION", "TIPO BUSCADO")
-    tree = ttk.Treeview(frame_t, columns=columnas, show="headings")
-    for col in columnas: 
-        tree.heading(col, text=col)
-        tree.column(col, anchor="center")
-    tree.pack(side="left", fill="both", expand=True)
-
-    with conectar_bd() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id_cliente, nombre, telefono, correo, presupuesto_max, id_ubicacion_interes, tipo_buscado FROM clientes")
-        for r in cursor.fetchall(): tree.insert("", "end", values=r)
-
-    def ejecutar_match_desde_tabla():
-        sel = tree.selection()
-        if not sel:
-            messagebox.showwarning("Selección vacía", "Selecciona un cliente de la lista.")
-            return
+        self.txt_col = ctk.CTkEntry(crear_bloque_campo(frame_interior, "Colonia:"), width=350)
+        self.txt_col.pack(side="left")
         
-        datos = tree.item(sel[0], "values")
-        nombre = datos[1]
-        try: presupuesto = float(datos[4])
-        except: presupuesto = 0.0
-        id_ub = int(datos[5])
-        tipo = datos[6]
-
-        calcular_y_mostrar_match(tipo, presupuesto, id_ub, nombre)
-
-    ctk.CTkButton(frame_acciones_cli, text="⚡ Encontrar Inmuebles (Auto-Match)", fg_color="#E65100", command=ejecutar_match_desde_tabla).pack(side="left", padx=5)
-
-# --------------------------------------------------------
-# VISTA: AGENDA DE CITAS COMPACTA DATETIME
-# --------------------------------------------------------
-def agendar_cita():
-    cli_sel = combo_agenda_cliente.get()
-    inm_sel = combo_agenda_inmueble.get()
-    if " - " not in cli_sel or " - " not in inm_sel:
-        messagebox.showwarning("Error", "Selecciona un cliente e inmueble válidos.")
-        return
-    
-    id_c = cli_sel.split(" - ")[0]
-    id_i = inm_sel.split(" - ")[0]
-    
-    # Combinación de fecha y hora bajo el estándar DATETIME estructurado
-    fecha_hora_combinada = f"{calendario.get_date()} {combo_hora.get()}:{combo_minuto.get()}"
-    
-    try:
-        with conectar_bd() as conn:
-            cursor = conn.cursor()
-            cursor.execute("INSERT INTO citas (id_cliente, id_inmueble, fecha_hora, estado, notas) VALUES (?,?,?, 'Pendiente', ?)",
-                           (id_c, id_i, fecha_hora_combinada, txt_notas_cita.get().strip()))
-            conn.commit()
-        messagebox.showinfo("Éxito", "Cita agendada correctamente.")
-        actualizar_componentes_agenda()
-    except sqlite3.IntegrityError:
-        messagebox.showerror("Conflicto de Agenda", "Error de Overbooking: Este inmueble ya tiene una cita programada exactamente a esa misma fecha y hora.")
-
-def eliminar_cita():
-    seleccion = tree_agenda.selection()
-    if not seleccion:
-        messagebox.showwarning("Selección vacía", "Por favor, selecciona una cita de la tabla inferior.")
-        return
-    
-    datos_cita = tree_agenda.item(seleccion[0], "values")
-    id_cita = datos_cita[0]
-    
-    if messagebox.askyesno("Confirmar Eliminación", "¿Estás seguro de que deseas cancelar y remover esta cita?"):
-        with conectar_bd() as conn:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM citas WHERE id_cita = ?", (id_cita,))
-            conn.commit()
-        messagebox.showinfo("Eliminado", "La cita ha sido removida.")
-        actualizar_componentes_agenda()
-
-def actualizar_componentes_agenda():
-    combo_agenda_cliente.configure(values=obtener_lista_clientes_combo())
-    combo_agenda_inmueble.configure(values=obtener_lista_inmuebles_combo())
-    
-    for item in tree_agenda.get_children(): tree_agenda.delete(item)
-    with conectar_bd() as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT c.id_cita, cl.nombre, i.titulo, c.fecha_hora, c.estado 
-            FROM citas c
-            JOIN clientes cl ON c.id_cliente = cl.id_cliente
-            JOIN inmuebles i ON c.id_inmueble = i.id_inmueble
-            ORDER BY c.fecha_hora ASC
-        """)
-        for r in cursor.fetchall(): tree_agenda.insert("", "end", values=r)
-
-ctk.CTkLabel(frame_agenda, text="Calendario y Agenda de Citas", font=("Arial", 24, "bold"), text_color="#1A237E").pack(pady=(20, 10), padx=30, anchor="w")
-
-frame_modulo_agenda = ctk.CTkFrame(frame_agenda, fg_color="transparent")
-frame_modulo_agenda.pack(fill="x", padx=30, pady=10)
-
-frame_calendario_izq = ctk.CTkFrame(frame_modulo_agenda, fg_color="white", corner_radius=10)
-frame_calendario_izq.pack(side="left", fill="y", padx=(0, 15))
-
-estilo_ttk = ttk.Style()
-estilo_ttk.theme_use('clam')
-estilo_ttk.configure('custom.Calendar.ttk', background='#1A237E', foreground='white')
-
-calendario = Calendar(
-    frame_calendario_izq, selectmode='day', date_pattern='yyyy-mm-dd', style='custom.Calendar.ttk',
-    background='#1A237E', foreground='#FFFFFF', headersbackground='#1A237E', headersforeground='#FFFFFF',
-    normalbackground='#FFFFFF', normalforeground='#111111', weekendbackground='#F5F5F5', weekendforeground='#D32F2F',
-    selectbackground='#1E88E5', selectforeground='#FFFFFF', tooltipalpha=0.0
-)
-calendario.pack(padx=15, pady=15)
-
-frame_form_der = ctk.CTkFrame(frame_modulo_agenda, corner_radius=10, fg_color="white")
-frame_form_der.pack(side="left", fill="both", expand=True)
-
-ctk.CTkLabel(frame_form_der, text="Agendar Nueva Cita", font=("Arial", 14, "bold"), text_color="black").pack(anchor="w", pady=(15, 10), padx=15)
-
-combo_agenda_cliente = ctk.CTkComboBox(frame_form_der, width=350, values=[])
-combo_agenda_cliente.pack(pady=5, padx=15, anchor="w"); combo_agenda_cliente.set("Seleccionar Cliente Prospecto...")
-
-combo_agenda_inmueble = ctk.CTkComboBox(frame_form_der, width=350, values=[])
-combo_agenda_inmueble.pack(pady=5, padx=15, anchor="w"); combo_agenda_inmueble.set("Seleccionar Propiedad de Interés...")
-
-frame_hora_linea = ctk.CTkFrame(frame_form_der, fg_color="transparent")
-frame_hora_linea.pack(pady=5, padx=15, anchor="w")
-ctk.CTkLabel(frame_hora_linea, text="Hora: ", text_color="black").pack(side="left", padx=(0, 5))
-
-combo_hora = ctk.CTkComboBox(frame_hora_linea, width=80, values=[f"{i:02d}" for i in range(8, 21)])
-combo_hora.pack(side="left", padx=2)
-combo_minuto = ctk.CTkComboBox(frame_hora_linea, width=80, values=["00", "15", "30", "45"])
-combo_minuto.pack(side="left", padx=2)
-
-txt_notas_cita = ctk.CTkEntry(frame_form_der, width=350, placeholder_text="Objetivo de la visita")
-txt_notas_cita.pack(pady=10, padx=15, anchor="w")
-
-ctk.CTkButton(frame_form_der, text="📅 Registrar Cita Estricta", fg_color="#1A237E", command=agendar_cita).pack(pady=(5, 15), padx=15, anchor="w")
-
-frame_lista_agenda = ctk.CTkFrame(frame_agenda, fg_color="transparent")
-frame_lista_agenda.pack(fill="both", expand=True, padx=30, pady=(10, 20))
-
-tree_agenda = ttk.Treeview(frame_lista_agenda, columns=("ID", "CLIENTE", "PROPIEDAD", "FECHA_HORA", "ESTADO"), show="headings")
-for col in ("ID", "CLIENTE", "PROPIEDAD", "FECHA_HORA", "ESTADO"): 
-    tree_agenda.heading(col, text=col)
-    tree_agenda.column(col, anchor="center")
-tree_agenda.pack(fill="both", expand=True, pady=(0, 10))
-
-ctk.CTkButton(frame_lista_agenda, text="❌ Cancelar Cita Seleccionada", fg_color="#D32F2F", command=eliminar_cita).pack(anchor="w")
-
-# --------------------------------------------------------
-# VISTA: ADMINISTRACIÓN DE ASESORES
-# --------------------------------------------------------
-def guardar_asesor():
-    if not txt_nom_as.get().strip(): return
-    with conectar_bd() as conn:
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO asesores (nombre, telefono, correo, activo) VALUES (?,?,?,1)",
-                       (txt_nom_as.get().strip(), txt_tel_as.get().strip(), txt_cor_as.get().strip()))
-        conn.commit()
-    txt_nom_as.delete(0, 'end'); txt_tel_as.delete(0, 'end'); txt_cor_as.delete(0, 'end')
-    actualizar_tabla_asesores()
-
-def borrar_asesor_seleccionado():
-    seleccion = tree_asesores.selection()
-    if not seleccion:
-        messagebox.showwarning("Selección vacía", "Por favor, selecciona un asesor de la lista.")
-        return
-    
-    datos_asesor = tree_asesores.item(seleccion[0], "values")
-    id_asesor = datos_asesor[0]
-    nombre_asesor = datos_asesor[1]
-    
-    if int(id_asesor) == 1:
-        messagebox.showerror("Error", "El 'Asesor General' es estructural del sistema y no se puede remover.")
-        return
+        self.txt_mun = ctk.CTkEntry(crear_bloque_campo(frame_interior, "Municipio / Alc:"), width=350)
+        self.txt_mun.pack(side="left")
         
-    if messagebox.askyesno("Confirmar Baja", f"¿Estás seguro de que deseas dar de baja a {nombre_asesor}?\n\nSus registros vinculados serán transferidos al Asesor General."):
-        with conectar_bd() as conn:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE inmuebles SET id_asesor = 1 WHERE id_asesor = ?", (id_asesor,))
-            cursor.execute("UPDATE clientes SET id_asesor = 1 WHERE id_asesor = ?", (id_asesor,))
-            cursor.execute("UPDATE asesores SET activo = 0 WHERE id_asesor = ?", (id_asesor,))
-            conn.commit()
-            
-        messagebox.showinfo("Baja Exitosa", f"El asesor {nombre_asesor} ha sido desactivado sin comprometer la integridad referencial.")
-        actualizar_tabla_asesores()
+        self.txt_est = ctk.CTkEntry(crear_bloque_campo(frame_interior, "Estado:"), width=350)
+        self.txt_est.pack(side="left")
 
-def actualizar_tabla_asesores():
-    for item in tree_asesores.get_children(): tree_asesores.delete(item)
-    with conectar_bd() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id_asesor, nombre, telefono, correo FROM asesores WHERE activo = 1")
-        for r in cursor.fetchall(): tree_asesores.insert("", "end", values=r)
+        self.txt_m2t = ctk.CTkEntry(crear_bloque_campo(frame_interior, "M² Terreno:"), width=180)
+        self.txt_m2t.pack(side="left")
 
-ctk.CTkLabel(frame_asesores, text="Administración de Fuerza de Ventas", font=("Arial", 24, "bold")).pack(pady=10)
-frame_form_as = ctk.CTkFrame(frame_asesores)
-frame_form_as.pack(fill="x", padx=20, pady=10)
+        self.txt_m2c = ctk.CTkEntry(crear_bloque_campo(frame_interior, "M² Construcción:"), width=180)
+        self.txt_m2c.pack(side="left")
 
-txt_nom_as = ctk.CTkEntry(frame_form_as, placeholder_text="Nombre Completo"); txt_nom_as.pack(side="left", padx=5, pady=10, expand=True, fill="x")
-txt_tel_as = ctk.CTkEntry(frame_form_as, placeholder_text="Teléfono"); txt_tel_as.pack(side="left", padx=5, pady=10, expand=True, fill="x")
-txt_cor_as = ctk.CTkEntry(frame_form_as, placeholder_text="Correo Electrónico"); txt_cor_as.pack(side="left", padx=5, pady=10, expand=True, fill="x")
-ctk.CTkButton(frame_form_as, text="➕ Añadir Asesor", fg_color="#2E7D32", command=guardar_asesor).pack(side="left", padx=10)
-
-tree_asesores = ttk.Treeview(frame_asesores, columns=("ID", "NOMBRE", "TELEFONO", "CORREO"), show="headings")
-for col in ("ID", "NOMBRE", "TELEFONO", "CORREO"): tree_asesores.heading(col, text=col)
-tree_asesores.pack(fill="both", expand=True, padx=20, pady=10)
-
-ctk.CTkButton(frame_asesores, text="❌ Dar de Baja Asesor Seleccionado", fg_color="#D32F2F", command=borrar_asesor_seleccionado).pack(anchor="w", padx=20, pady=(0, 20))
-
-# --------------------------------------------------------
-# VISTA: PAPELERA DE RECICLAJE
-# --------------------------------------------------------
-def actualizar_tabla_papelera():
-    for item in tree_papelera.get_children(): tree_papelera.delete(item)
-    with conectar_bd() as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT i.id_inmueble, i.titulo, i.precio, u.colonia 
-            FROM inmuebles i 
-            JOIN ubicaciones u ON i.id_ubicacion = u.id_ubicacion 
-            WHERE i.eliminado = 1
-        """)
-        for r in cursor.fetchall(): tree_papelera.insert("", "end", values=r)
-
-def restaurar_inmueble():
-    sel = tree_papelera.selection()
-    if not sel: return
-    id_i = tree_papelera.item(sel[0], "values")[0]
-    with conectar_bd() as conn:
-        cursor = conn.cursor()
-        cursor.execute("UPDATE inmuebles SET eliminado = 0 WHERE id_inmueble = ?", (id_i,))
-        conn.commit()
-    actualizar_tabla_papelera()
-    messagebox.showinfo("Éxito", "Propiedad restaurada al inventario activo.")
-
-ctk.CTkLabel(frame_papelera, text="Papelera de Reciclaje (Inmuebles)", font=("Arial", 24, "bold")).pack(pady=10)
-ctk.CTkButton(frame_papelera, text="🔄 Restaurar Propiedad Seleccionada", fg_color="#2E7D32", command=restaurar_inmueble).pack(pady=5)
-
-tree_papelera = ttk.Treeview(frame_papelera, columns=("ID", "TITULO", "PRECIO", "COLONIA"), show="headings")
-for col in ("ID", "TITULO", "PRECIO", "COLONIA"): tree_papelera.heading(col, text=col)
-tree_papelera.pack(fill="both", expand=True, padx=20, pady=15)
-
-# --------------------------------------------------------
-# VENTANA DINÁMICA: INVENTARIO ACTIVO CON JOIN UBICACIÓN
-# --------------------------------------------------------
-def mostrar_inmuebles():
-    global ventana_inventario
-    if ventana_inventario is not None and ventana_inventario.winfo_exists():
-        ventana_inventario.focus()
-        return
-
-    ventana_inventario = ctk.CTkToplevel(app)
-    ventana_inventario.title("Inventario de Inmuebles Activos")
-    ventana_inventario.geometry("1150x650")
-    ventana_inventario.after(100, lambda: ventana_inventario.focus())
-
-    frame_filtros = ctk.CTkFrame(ventana_inventario)
-    frame_filtros.pack(fill="x", padx=10, pady=10)
-
-    txt_colonia_buscar = ctk.CTkEntry(frame_filtros, width=180, placeholder_text="Filtrar por Colonia")
-    txt_colonia_buscar.pack(side="left", padx=5)
-    txt_precio_max = ctk.CTkEntry(frame_filtros, width=150, placeholder_text="Precio Máximo")
-    txt_precio_max.pack(side="left", padx=5)
-
-    frame_tabla = ctk.CTkFrame(ventana_inventario)
-    frame_tabla.pack(fill="both", expand=True, padx=10, pady=10)
-
-    columnas = ("ID", "OPERACION", "TIPO", "TITULO", "PRECIO", "COLONIA")
-    tree = ttk.Treeview(frame_tabla, columns=columnas, show="headings")
-    for col in columnas: tree.heading(col, text=col)
-    tree.pack(side="left", fill="both", expand=True)
-
-    def cargar_datos():
-        for item in tree.get_children(): tree.delete(item)
-        colonia_f = f"%{txt_colonia_buscar.get().strip()}%"
+        self.txt_desc = ctk.CTkEntry(crear_bloque_campo(frame_interior, "Descripción:"), width=450)
+        self.txt_desc.pack(side="left")
         
+        self.cmb_ase_inm = ctk.CTkComboBox(crear_bloque_campo(frame_interior, "Asesor Asignado:"), values=["Seleciona Asesor"], width=280)
+        self.cmb_ase_inm.pack(side="left")
+
+        f_media = ctk.CTkFrame(frame_interior, fg_color="transparent")
+        f_media.pack(fill="x", padx=20, pady=15)
+        self.lbl_fotos_info = ctk.CTkLabel(f_media, text="Fotos Cargadas: 0", font=("Arial", 12, "italic"))
+        self.lbl_fotos_info.pack(side="left", padx=10)
+        ctk.CTkButton(f_media, text="📷 Seleccionar Imágenes", fg_color="#455A64", command=self.cargar_fotos_dialogo_alta).pack(side="left", padx=10)
+        
+        ctk.CTkButton(frame_interior, text="💾 Registrar Inmueble", fg_color="#2E7D32", height=40, font=("Arial", 13, "bold"), command=self.procesar_guardar_inmueble).pack(pady=20, padx=20, fill="x")
+
+        # ---------------------------------------------------------------------
+        # PANEL: REGISTRO DE PROSPECTOS (ASPECTO ORIGINAL RESTAURADO)
+        # ---------------------------------------------------------------------
+        self.frame_alta_clientes = ctk.CTkFrame(self.contenedor_principal, fg_color="white", corner_radius=12, border_width=1, border_color="#E0E0E0")
+        ctk.CTkLabel(self.frame_alta_clientes, text="Registro y Alta de Prospectos (Leads)", font=("Arial", 20, "bold"), text_color="#1A237E").pack(pady=20, padx=25, anchor="w")
+        
+        def crear_fila_cliente(texto):
+            f = ctk.CTkFrame(self.frame_alta_clientes, fg_color="transparent")
+            f.pack(fill="x", padx=25, pady=6)
+            ctk.CTkLabel(f, text=texto, font=("Arial", 12, "bold"), width=180, anchor="w").pack(side="left")
+            return f
+
+        self.txt_nom_cli = ctk.CTkEntry(crear_fila_cliente("Nombre del Cliente:"), width=400)
+        self.txt_nom_cli.pack(side="left")
+        self.txt_tel_cli = ctk.CTkEntry(crear_fila_cliente("Teléfono Celular (10 dgt):"), width=400)
+        self.txt_tel_cli.pack(side="left")
+        self.txt_cor_cli = ctk.CTkEntry(crear_fila_cliente("Correo Electrónico:"), width=400)
+        self.txt_cor_cli.pack(side="left")
+        self.txt_pres_cli = ctk.CTkEntry(crear_fila_cliente("Presupuesto Máximo:"), width=400)
+        self.txt_pres_cli.pack(side="left")
+        self.txt_col_cli = ctk.CTkEntry(crear_fila_cliente("Colonia de Interés:"), width=400)
+        self.txt_col_cli.pack(side="left")
+        
+        self.cmb_tipo_cli = ctk.CTkComboBox(crear_fila_cliente("Inmueble Solicitado:"), values=["Casa", "Departamento", "Terreno", "Local", "Oficina"], width=400)
+        self.cmb_tipo_cli.pack(side="left")
+        self.cmb_ase_cli = ctk.CTkComboBox(crear_fila_cliente("Asesor de Seguimiento:"), width=400)
+        self.cmb_ase_cli.pack(side="left")
+
+        f_acts_cli = ctk.CTkFrame(self.frame_alta_clientes, fg_color="transparent")
+        f_acts_cli.pack(fill="x", padx=25, pady=25)
+        ctk.CTkButton(f_acts_cli, text="💾 Registrar Cliente", fg_color="#2E7D32", height=38, command=self.procesar_guardar_cliente).pack(side="left", padx=5)
+        ctk.CTkButton(f_acts_cli, text="🧼 Eliminar Clientes Duplicados", fg_color="#78909C", height=38, command=self.eliminar_clientes_duplicados).pack(side="left", padx=5)
+
+        # ---------------------------------------------------------------------
+        # PANEL: ADMINISTRAR ASESORES
+        # ---------------------------------------------------------------------
+        self.frame_asesores = ctk.CTkFrame(self.contenedor_principal, fg_color="transparent")
+        f_bloque_as = ctk.CTkFrame(self.frame_asesores, fg_color="white", corner_radius=12, border_width=1, border_color="#E0E0E0")
+        f_bloque_as.pack(fill="both", expand=True)
+        
+        ctk.CTkLabel(f_bloque_as, text="Administración y Control de Asesores", font=("Arial", 20, "bold"), text_color="#1A237E").pack(pady=15, padx=20, anchor="w")
+        
+        f_alta_as = ctk.CTkFrame(f_bloque_as, fg_color="transparent")
+        f_alta_as.pack(fill="x", padx=20, pady=10)
+        
+        self.txt_n_as = ctk.CTkEntry(f_alta_as, placeholder_text="Nombre Completo", width=180); self.txt_n_as.pack(side="left", padx=4)
+        self.txt_emp_as = ctk.CTkEntry(f_alta_as, placeholder_text="Empresa", width=140); self.txt_emp_as.pack(side="left", padx=4)
+        self.txt_t_as = ctk.CTkEntry(f_alta_as, placeholder_text="Teléfono (10 dgt)", width=140); self.txt_t_as.pack(side="left", padx=4)
+        self.txt_c_as = ctk.CTkEntry(f_alta_as, placeholder_text="Correo Válido", width=180); self.txt_c_as.pack(side="left", padx=4)
+        
+        ctk.CTkButton(f_alta_as, text="➕ Dar de Alta", command=self.agregar_asesor, fg_color="#1A237E").pack(side="left", padx=4)
+
+        self.tree_as = ttk.Treeview(f_bloque_as, columns=("ID", "NOMBRE", "TELEFONO", "CORREO"), show="headings")
+        for c in ("ID", "NOMBRE", "TELEFONO", "CORREO"): self.tree_as.heading(c, text=c); self.tree_as.column(c, anchor="center")
+        self.tree_as.pack(fill="both", expand=True, padx=20, pady=15)
+
+        ctk.CTkButton(f_bloque_as, text="🗑️ Eliminar Asesor Seleccionado de Forma Segura", fg_color="#C62828", command=self.eliminar_asesor_seguro).pack(pady=15, padx=20, anchor="w")
+
+        # ---------------------------------------------------------------------
+        # PANEL: AGENDA DE CITAS
+        # ---------------------------------------------------------------------
+        self.frame_agenda = ctk.CTkFrame(self.contenedor_principal, fg_color="transparent")
+        f_bloque_ag = ctk.CTkFrame(self.frame_agenda, fg_color="white", corner_radius=12, border_width=1, border_color="#E0E0E0")
+        f_bloque_ag.pack(fill="both", expand=True)
+        
+        ctk.CTkLabel(f_bloque_ag, text="Agenda de Citas Inteligente", font=("Arial", 20, "bold"), text_color="#1A237E").pack(pady=15, padx=20, anchor="w")
+        
+        frame_top_ag = ctk.CTkFrame(f_bloque_ag, fg_color="transparent")
+        frame_top_ag.pack(fill="x", padx=20)
+
+        f_cal = ctk.CTkFrame(frame_top_ag, fg_color="white", corner_radius=10, border_width=1, border_color="#E0E0E0")
+        f_cal.pack(side="left", padx=(0, 15))
+        
+        self.cal = Calendar(f_cal, selectmode='day', date_pattern='yyyy-mm-dd',
+                            background='#1A237E', foreground='white', 
+                            headersbackground='#ECEFF1', headersforeground='black',
+                            selectbackground='#1E88E5', selectforeground='white',
+                            normalbackground='white', normalforeground='black',
+                            weekendbackground='#F5F5F5', weekendforeground='black')
+        self.cal.pack(padx=10, pady=10)
+
+        f_form_ag = ctk.CTkFrame(frame_top_ag, fg_color="transparent")
+        f_form_ag.pack(side="left", fill="both", expand=True)
+
+        ctk.CTkLabel(f_form_ag, text="Seleccionar Cliente Prospecto:", font=("Arial", 11, "bold")).pack(anchor="w", pady=(2,0))
+        self.cmb_age_cli = ctk.CTkComboBox(f_form_ag, width=380); self.cmb_age_cli.pack(pady=2, anchor="w")
+        
+        ctk.CTkLabel(f_form_ag, text="Seleccionar Propiedad del Inventario:", font=("Arial", 11, "bold")).pack(anchor="w", pady=(2,0))
+        self.cmb_age_inm = ctk.CTkComboBox(f_form_ag, width=380); self.cmb_age_inm.pack(pady=2, anchor="w")
+        
+        ctk.CTkLabel(f_form_ag, text="Hora de Cita (HH:MM):", font=("Arial", 11, "bold")).pack(anchor="w", pady=(2,0))
+        f_hm = ctk.CTkFrame(f_form_ag, fg_color="transparent")
+        f_hm.pack(pady=2, anchor="w")
+        self.cmb_h = ctk.CTkComboBox(f_hm, width=80, values=[f"{i:02d}" for i in range(8, 21)]); self.cmb_h.pack(side="left", padx=2)
+        self.cmb_m = ctk.CTkComboBox(f_hm, width=80, values=["00", "15", "30", "45"]); self.cmb_m.pack(side="left", padx=2)
+
+        self.txt_nota_cita = ctk.CTkEntry(f_form_ag, width=380, placeholder_text="Notas especiales..."); self.txt_nota_cita.pack(pady=8, anchor="w")
+        ctk.CTkButton(f_form_ag, text="📅 Agendar Nueva Cita", command=self.registrar_cita_agenda, fg_color="#1A237E").pack(pady=4, anchor="w")
+
+        self.tree_age = ttk.Treeview(f_bloque_ag, columns=("ID", "CLIENTE", "INMUEBLE", "FECHA_HORA", "NOTAS"), show="headings")
+        for c in ("ID", "CLIENTE", "INMUEBLE", "FECHA_HORA", "NOTAS"): self.tree_age.heading(c, text=c); self.tree_age.column(c, anchor="center")
+        self.tree_age.pack(fill="both", expand=True, padx=20, pady=10)
+
+        f_ops_citas = ctk.CTkFrame(f_bloque_ag, fg_color="transparent")
+        f_ops_citas.pack(fill="x", padx=20, pady=10)
+        ctk.CTkButton(f_ops_citas, text="⏳ Cambiar Fecha/Hora Cita", fg_color="#F57C00", command=self.modificar_fecha_cita).pack(side="left", padx=5)
+        ctk.CTkButton(f_ops_citas, text="❌ Cancelar/Eliminar Cita", fg_color="#D32F2F", command=self.eliminar_cita).pack(side="left", padx=5)
+
+        # ---------------------------------------------------------------------
+        # PANEL: PAPELERA DE RECICLAJE
+        # ---------------------------------------------------------------------
+        self.frame_papelera = ctk.CTkFrame(self.contenedor_principal, fg_color="transparent")
+        f_bloque_pap = ctk.CTkFrame(self.frame_papelera, fg_color="white", corner_radius=12, border_width=1, border_color="#E0E0E0")
+        f_bloque_pap.pack(fill="both", expand=True)
+        
+        ctk.CTkLabel(f_bloque_pap, text="Papelera de Reciclaje de Inmuebles", font=("Arial", 20, "bold"), text_color="#1A237E").pack(pady=15, padx=20, anchor="w")
+        
+        f_btns_pap = ctk.CTkFrame(f_bloque_pap, fg_color="transparent")
+        f_btns_pap.pack(fill="x", padx=20)
+        ctk.CTkButton(f_btns_pap, text="🔄 Restaurar Propiedad", fg_color="#2E7D32", command=self.restaurar_propiedad_papelera).pack(side="left", padx=5)
+        ctk.CTkButton(f_btns_pap, text="🚨 Eliminar Definitivamente", fg_color="#D32F2F", command=self.eliminar_definitivamente_inmueble).pack(side="left", padx=5)
+        
+        self.tree_pap = ttk.Treeview(f_bloque_pap, columns=("ID", "TITULO", "PRECIO"), show="headings")
+        for c in ("ID", "TITULO", "PRECIO"): self.tree_pap.heading(c, text=c); self.tree_pap.column(c, anchor="center")
+        self.tree_pap.pack(fill="both", expand=True, padx=20, pady=15)
+
+    # ---------------------------------------------------------------------
+    # LOGICA LOGÍSTICA COMPLETA Y VALIDACIONES ARREGLADAS
+    # ---------------------------------------------------------------------
+    def cargar_fotos_dialogo_alta(self):
+        archivos = filedialog.askopenfilenames(title="Seleccionar Imágenes", filetypes=[("Imágenes", "*.jpg *.jpeg *.png")])
+        if archivos:
+            self.rutas_fotos_temporales = list(archivos)
+            self.lbl_fotos_info.configure(text=f"Fotos Cargadas: {len(self.rutas_fotos_temporales)}")
+
+    def procesar_guardar_inmueble(self):
         try:
-            raw_p = txt_precio_max.get().replace(",", "").replace("$", "").strip()
-            precio_f = float(raw_p) if raw_p else 999999999.0
+            precio = float(self.txt_prc.get().strip())
+            m2_t = float(self.txt_m2t.get().strip())
+            m2_c = float(self.txt_m2c.get().strip())
         except ValueError:
-            precio_f = 999999999.0
+            messagebox.showerror("Error", "Precio, M2 Terreno y M2 Construcción requieren números reales.")
+            return
 
-        with conectar_bd() as conn:
+        if not self.txt_tit.get().strip() or not self.txt_col.get().strip():
+            messagebox.showwarning("Atención", "Título comercial y Colonia son obligatorios.")
+            return
+
+        id_ub = db.obtener_o_crear_ubicacion(self.txt_col.get().strip(), self.txt_mun.get().strip(), self.txt_est.get().strip())
+        id_ase = self.obtener_id_asesor_por_nombre(self.cmb_ase_inm.get())
+
+        with db.conectar_bd() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT i.id_inmueble, i.tipo_operacion, i.tipo_inmueble, i.titulo, i.precio, u.colonia 
-                FROM inmuebles i 
-                JOIN ubicaciones u ON i.id_ubicacion = u.id_ubicacion
-                WHERE i.eliminado = 0 AND u.colonia LIKE ? AND i.precio <= ?
-            """, (colonia_f, precio_f))
-            for row in cursor.fetchall(): tree.insert("", "end", values=row)
+                INSERT INTO inmuebles (tipo_operacion, tipo_inmueble, titulo, precio, id_ubicacion, descripcion, m2_terreno, m2_construccion, id_asesor, eliminado)
+                VALUES (?,?,?,?,?,?,?,?,?,0)
+            """, (self.cmb_op.get(), self.cmb_tipo.get(), self.txt_tit.get().strip(), precio, id_ub, self.txt_desc.get().strip(), m2_t, m2_c, id_ase))
+            id_nuevo_inm = cursor.lastrowid
 
-    ctk.CTkButton(frame_filtros, text="🔍 Filtrar", command=cargar_datos, width=100).pack(side="left", padx=5)
-    cargar_datos()
+            carpeta_propiedad = f"fotos/propiedad_{id_nuevo_inm}"
+            os.makedirs(carpeta_propiedad, exist_ok=True)
 
-    def enviar_a_papelera():
-        seleccion = tree.selection()
-        if not seleccion: return
-        id_inmueble = tree.item(seleccion[0], "values")[0]
-        if messagebox.askyesno("Confirmar", f"¿Mover la propiedad #{id_inmueble} a la papelera?"):
-            with conectar_bd() as conn:
+            for idx, ruta_orig in enumerate(self.rutas_fotos_temporales):
+                ext = os.path.splitext(ruta_orig)[1]
+                nombre_destino = f"{carpeta_propiedad}/inm_{id_nuevo_inm}_{idx}{ext}"
+                try:
+                    shutil.copy(ruta_orig, nombre_destino)
+                    es_principal = 1 if idx == 0 else 0
+                    cursor.execute("INSERT INTO fotos_inmueble (id_inmueble, ruta_archivo, principal) VALUES (?,?,?)", (id_nuevo_inm, nombre_destino, es_principal))
+                except: pass
+            conn.commit()
+
+        messagebox.showinfo("Éxito", f"Inmueble ID #{id_nuevo_inm} guardado e indexado por carpeta.")
+        for x in [self.txt_tit, self.txt_prc, self.txt_col, self.txt_mun, self.txt_est, self.txt_m2t, self.txt_m2c, self.txt_desc]: x.delete(0, 'end')
+        self.rutas_fotos_temporales = []
+        self.lbl_fotos_info.configure(text="Fotos Cargadas: 0")
+
+    def procesar_guardar_cliente(self):
+        nombre = self.txt_nom_cli.get().strip()
+        telefono = self.txt_tel_cli.get().strip()
+        correo = self.txt_cor_cli.get().strip()
+        colonia = self.txt_col_cli.get().strip()
+
+        if not telefono.isdigit() or len(telefono) != 10:
+            messagebox.showerror("Error de Formato", "El campo de teléfono debe ser obligatoriamente un número de 10 dígitos.")
+            return
+        if "@" not in correo or "." not in correo:
+            messagebox.showerror("Error de Formato", "Ingrese una dirección de correo electrónico válida.")
+            return
+        if not nombre or not colonia:
+            messagebox.showwarning("Atención", "Los campos Nombre y Colonia son requeridos.")
+            return
+
+        try: pres = float(self.txt_pres_cli.get().strip())
+        except: pres = 0.0
+
+        id_ub = db.obtener_o_crear_ubicacion(colonia, "Por definir", "Por definir")
+        id_ase = self.obtener_id_asesor_por_nombre(self.cmb_ase_cli.get())
+
+        with db.conectar_bd() as conn:
+            conn.cursor().execute("""
+                INSERT INTO clientes (nombre, telephone, correo, presupuesto_max, id_ubicacion_interes, tipo_buscado, id_asesor)
+                VALUES (?,?,?,?,?,?,?)
+            """, (nombre, telefono, correo, pres, id_ub, self.cmb_tipo_cli.get(), id_ase))
+            conn.commit()
+
+        messagebox.showinfo("Éxito", f"Cliente '{nombre}' dado de alta exitosamente.")
+        for x in [self.txt_nom_cli, self.txt_tel_cli, self.txt_cor_cli, self.txt_pres_cli, self.txt_col_cli]: x.delete(0, 'end')
+
+    def eliminar_clientes_duplicados(self):
+        with db.conectar_bd() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM clientes WHERE id_cliente NOT IN (SELECT MIN(id_cliente) FROM clientes GROUP BY nombre, telephone, correo)")
+            afectados = conn.total_changes
+            conn.commit()
+        messagebox.showinfo("Limpieza Exitosa", f"Se eliminaron {afectados} registros duplicados idénticos.")
+
+    def agregar_asesor(self):
+        nombre = self.txt_n_as.get().strip()
+        empresa = self.txt_emp_as.get().strip()
+        tel = self.txt_t_as.get().strip()
+        correo = self.txt_c_as.get().strip()
+
+        if not nombre or not empresa:
+            messagebox.showerror("Campos Vacíos", "Los campos Nombre Completo y Empresa no deben ir vacíos.")
+            return
+        if not tel.isdigit() or len(tel) != 10:
+            messagebox.showerror("Error de Formato", "El campo Teléfono debe ser estrictamente de 10 dígitos numéricos.")
+            return
+        if "@" not in correo or "." not in correo:
+            messagebox.showerror("Error de Formato", "Formato de Correo Electrónico inválido.")
+            return
+
+        with db.conectar_bd() as conn:
+            conn.cursor().execute("INSERT INTO asesores (nombre, telephone, correo, activo) VALUES (?,?,?,1)", (f"{nombre} ({empresa})", tel, correo))
+            conn.commit()
+
+        messagebox.showinfo("Éxito", "Asesor guardado correctamente.")
+        for x in [self.txt_n_as, self.txt_emp_as, self.txt_t_as, self.txt_c_as]: x.delete(0, 'end')
+        self.actualizar_tabla_asesores()
+
+    def eliminar_asesor_seguro(self):
+        sel = self.tree_as.selection()
+        if not sel: return
+        id_as = self.tree_as.item(sel[0], "values")[0]
+        if int(id_as) == 1:
+            messagebox.showerror("Denegado", "El asesor número 1 primario del sistema no puede ser removido.")
+            return
+
+        if messagebox.askyesno("Confirmar", "Se reasignarán propiedades y clientes activos al Asesor Raíz para evitar huérfanos. ¿Proceder?"):
+            with db.conectar_bd() as conn:
                 cursor = conn.cursor()
-                cursor.execute("UPDATE inmuebles SET eliminado = 1 WHERE id_inmueble = ?", (id_inmueble,))
+                cursor.execute("UPDATE inmuebles SET id_asesor = 1 WHERE id_asesor = ?", (id_as,))
+                cursor.execute("UPDATE clientes SET id_asesor = 1 WHERE id_asesor = ?", (id_as,))
+                cursor.execute("DELETE FROM asesores WHERE id_asesor = ?", (id_as,))
                 conn.commit()
-            cargar_datos()
+            self.actualizar_tabla_asesores()
 
-    ctk.CTkButton(frame_filtros, text="🗑️ Mover a Papelera", fg_color="#E65100", command=enviar_a_papelera).pack(side="right", padx=10)
+    def actualizar_tabla_asesores(self):
+        for item in self.tree_as.get_children(): self.tree_as.delete(item)
+        with db.conectar_bd() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id_asesor, nombre, telephone, correo FROM asesores WHERE activo = 1")
+            for row in cursor.fetchall(): self.tree_as.insert("", "end", values=row)
+        
+        lista = []
+        with db.conectar_bd() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT nombre FROM asesores")
+            lista = [r[0] for r in cursor.fetchall()]
+        if lista:
+            self.cmb_ase_inm.configure(values=lista)
+            self.cmb_ase_cli.configure(values=lista)
 
-    def editar_inmueble(event):
-        seleccion = tree.selection()
-        if not seleccion: return
-        id_inmueble = tree.item(seleccion[0], "values")[0]
+    def actualizar_agenda_datos(self):
+        for item in self.tree_age.get_children(): self.tree_age.delete(item)
+        with db.conectar_bd() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id_cliente, nombre FROM clientes")
+            clis = [f"{r[0]}- {r[1]}" for r in cursor.fetchall()]
+            cursor.execute("SELECT id_inmueble, titulo FROM inmuebles WHERE eliminado=0")
+            inms = [f"{r[0]}- {r[1]}" for r in cursor.fetchall()]
+            
+        if clis: self.cmb_age_cli.configure(values=clis)
+        if inms: self.cmb_age_inm.configure(values=inms)
 
-        ventana_edit = ctk.CTkToplevel(ventana_inventario)
-        ventana_edit.title(f"Ficha de Edición — ID #{id_inmueble}")
-        ventana_edit.geometry("500x780")
-        ventana_edit.after(100, lambda: ventana_edit.focus())
+        with db.conectar_bd() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT c.id_cita, cl.nombre, i.titulo, c.fecha_hora, c.nota 
+                FROM citas c JOIN clientes cl ON c.id_cliente = cl.id_cliente JOIN inmuebles i ON c.id_inmueble = i.id_inmueble
+            """)
+            for row in cursor.fetchall(): self.tree_age.insert("", "end", values=row)
 
-        with conectar_bd() as conn:
+    def registrar_cita_agenda(self):
+        if not self.cmb_age_cli.get() or not self.cmb_age_inm.get(): return
+        id_c = self.cmb_age_cli.get().split("-")[0].strip()
+        id_i = self.cmb_age_inm.get().split("-")[0].strip()
+        fecha_completa = f"{self.cal.get_date()} {self.cmb_h.get()}:{self.cmb_m.get()}"
+        
+        with db.conectar_bd() as conn:
+            conn.cursor().execute("INSERT INTO citas (id_cliente, id_inmueble, fecha_hora, nota, id_asesor) VALUES (?,?,?,?,1)",
+                           (id_c, id_i, fecha_completa, self.txt_nota_cita.get().strip()))
+            conn.commit()
+        self.actualizar_agenda_datos()
+
+    def modificar_fecha_cita(self):
+        sel = self.tree_age.selection()
+        if not sel: return
+        id_cita = self.tree_age.item(sel[0], "values")[0]
+        nueva_fecha_hora = f"{self.cal.get_date()} {self.cmb_h.get()}:{self.cmb_m.get()}"
+        with db.conectar_bd() as conn:
+            conn.cursor().execute("UPDATE citas SET fecha_hora = ? WHERE id_cita = ?", (nueva_fecha_hora, id_cita))
+            conn.commit()
+        self.actualizar_agenda_datos()
+        messagebox.showinfo("Éxito", "La cita cambió su horario de visita.")
+
+    def eliminar_cita(self):
+        sel = self.tree_age.selection()
+        if not sel: return
+        id_cita = self.tree_age.item(sel[0], "values")[0]
+        if messagebox.askyesno("Confirmar", "¿Eliminar cita de la agenda?"):
+            with db.conectar_bd() as conn:
+                conn.cursor().execute("DELETE FROM citas WHERE id_cita = ?", (id_cita,))
+                conn.commit()
+            self.actualizar_agenda_datos()
+
+    def actualizar_tabla_papelera(self):
+        for item in self.tree_pap.get_children(): self.tree_pap.delete(item)
+        with db.conectar_bd() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id_inmueble, titulo, precio FROM inmuebles WHERE eliminado = 1")
+            for row in cursor.fetchall(): self.tree_pap.insert("", "end", values=row)
+
+    def restaurar_propiedad_papelera(self):
+        sel = self.tree_pap.selection()
+        if not sel: return
+        id_inm = self.tree_pap.item(sel[0], "values")[0]
+        with db.conectar_bd() as conn:
+            conn.cursor().execute("UPDATE inmuebles SET eliminado = 0 WHERE id_inmueble = ?", (id_inm,))
+            conn.commit()
+        self.actualizar_tabla_papelera()
+
+    def eliminar_definitivamente_inmueble(self):
+        sel = self.tree_pap.selection()
+        if not sel: return
+        id_inm = self.tree_pap.item(sel[0], "values")[0]
+
+        if messagebox.askyesno("PELIGRO", "Esta acción purgará el inmueble y borrará físicamente sus imágenes. ¿Continuar?"):
+            carpeta_prop = f"fotos/propiedad_{id_inm}"
+            if os.path.exists(carpeta_prop):
+                try: shutil.rmtree(carpeta_prop)
+                except: pass
+
+            with db.conectar_bd() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM fotos_inmueble WHERE id_inmueble = ?", (id_inm,))
+                cursor.execute("DELETE FROM citas WHERE id_inmueble = ?", (id_inm,))
+                cursor.execute("DELETE FROM inmuebles WHERE id_inmueble = ?", (id_inm,))
+                conn.commit()
+            self.actualizar_tabla_papelera()
+
+    def obtener_id_asesor_por_nombre(self, nombre_completo):
+        try:
+            with db.conectar_bd() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT id_asesor FROM asesores WHERE nombre = ?", (nombre_completo,))
+                res = cursor.fetchone()
+                return res[0] if res else 1
+        except: return 1
+
+    # ---------------------------------------------------------------------
+    # VENTANA: BUSCADOR DE INVENTARIO OPERATIVO (FILTRO MANUAL + INMEDIATO)
+    # ---------------------------------------------------------------------
+    def mostrar_inventario(self):
+        if self.ventana_inventario and self.ventana_inventario.winfo_exists():
+            self.ventana_inventario.focus()
+            return
+
+        self.ventana_inventario = ctk.CTkToplevel(self)
+        self.ventana_inventario.title("Buscador Operativo Avanzado")
+        self.ventana_inventario.geometry("1280x680")
+
+        frame_filtros = ctk.CTkFrame(self.ventana_inventario, fg_color="white", border_width=1, border_color="#E0E0E0")
+        frame_filtros.pack(fill="x", padx=15, pady=10)
+
+        # PUNTO 4: Campos de filtrado en el orden exacto solicitado
+        cmb_f_tipo = ctk.CTkComboBox(frame_filtros, values=["Todos", "Casa", "Departamento", "Terreno", "Local", "Oficina"], width=130)
+        cmb_f_tipo.pack(side="left", padx=5, pady=8)
+
+        cmb_f_op = ctk.CTkComboBox(frame_filtros, values=["Todos", "VENTA", "RENTA"], width=110)
+        cmb_f_op.pack(side="left", padx=5, pady=8)
+
+        txt_f_precio = ctk.CTkEntry(frame_filtros, placeholder_text="Precio Max...", width=110)
+        txt_f_precio.pack(side="left", padx=5, pady=8)
+
+        txt_f_m2t = ctk.CTkEntry(frame_filtros, placeholder_text="M2 Terreno Min...", width=120)
+        txt_f_m2t.pack(side="left", padx=5, pady=8)
+
+        txt_f_m2c = ctk.CTkEntry(frame_filtros, placeholder_text="M2 Const Min...", width=120)
+        txt_f_m2c.pack(side="left", padx=5, pady=8)
+
+        txt_buscar_col = ctk.CTkEntry(frame_filtros, placeholder_text="Filtrar Colonia...", width=140)
+        txt_buscar_col.pack(side="left", padx=5, pady=8)
+
+        frame_tabla = ctk.CTkFrame(self.ventana_inventario)
+        frame_tabla.pack(fill="both", expand=True, padx=15, pady=5)
+
+        cols = ("ID", "OPERACION", "TIPO", "TITULO", "PRECIO", "M2 TERRENO", "M2 CONST", "COLONIA", "ESTATUS")
+        tree = ttk.Treeview(frame_tabla, columns=cols, show="headings")
+        for c in cols: tree.heading(c, text=c); tree.column(c, anchor="center", width=110)
+        tree.pack(fill="both", expand=True)
+
+        def ejecutar_busqueda_automatica(*args):
+            for item in tree.get_children(): tree.delete(item)
+            query = """
+                SELECT i.id_inmueble, i.tipo_operacion, i.tipo_inmueble, i.titulo, i.precio, i.m2_terreno, i.m2_construccion, u.colonia,
+                CASE WHEN i.eliminado = 2 THEN 'Vendido/Rentado' ELSE 'Disponible' END
+                FROM inmuebles i JOIN ubicaciones u ON i.id_ubicacion = u.id_ubicacion WHERE i.eliminado != 1 AND u.colonia LIKE ?
+            """
+            params = [f"%{txt_buscar_col.get().strip()}%"]
+
+            if cmb_f_tipo.get() != "Todos":
+                query += " AND i.tipo_inmueble = ?"; params.append(cmb_f_tipo.get())
+            if cmb_f_op.get() != "Todos":
+                query += " AND i.tipo_operacion = ?"; params.append(cmb_f_op.get())
+            if txt_f_precio.get().strip():
+                try: query += " AND i.precio <= ?"; params.append(float(txt_f_precio.get().strip()))
+                except: pass
+            if txt_f_m2t.get().strip():
+                try: query += " AND i.m2_terreno >= ?"; params.append(float(txt_f_m2t.get().strip()))
+                except: pass
+            if txt_f_m2c.get().strip():
+                try: query += " AND i.m2_construccion >= ?"; params.append(float(txt_f_m2c.get().strip()))
+                except: pass
+
+            with db.conectar_bd() as conn:
+                cursor = conn.cursor()
+                cursor.execute(query, params)
+                for row in cursor.fetchall(): tree.insert("", "end", values=row)
+
+        # PUNTO 5 RESTAURADO: Reincorporación del primer botón de filtrado manual en el layout
+        btn_filtrar = ctk.CTkButton(frame_filtros, text="🔍 Filtrar", command=ejecutar_busqueda_automatica, fg_color="#1A237E", width=90)
+        btn_filtrar.pack(side="left", padx=10)
+
+        # PUNTO 16: Refresco inmediato automatizado al teclear o cambiar selecciones
+        txt_buscar_col.bind("<KeyRelease>", ejecutar_busqueda_automatica)
+        txt_f_precio.bind("<KeyRelease>", ejecutar_busqueda_automatica)
+        txt_f_m2t.bind("<KeyRelease>", ejecutar_busqueda_automatica)
+        txt_f_m2c.bind("<KeyRelease>", ejecutar_busqueda_automatica)
+        cmb_f_tipo.configure(command=ejecutar_busqueda_automatica)
+        cmb_f_op.configure(command=ejecutar_busqueda_automatica)
+
+        ejecutar_busqueda_automatica()
+
+        f_ops = ctk.CTkFrame(self.ventana_inventario, fg_color="transparent")
+        f_ops.pack(fill="x", padx=15, pady=10)
+
+        def abrir_ficha_edicion():
+            sel = tree.selection()
+            if not sel: return
+            self.lanzar_ventana_detalle_edicion(tree.item(sel[0], "values")[0], ejecutar_busqueda_automatica)
+
+        def marcar_como_vendido_ya():
+            sel = tree.selection()
+            if not sel: return
+            id_inm = tree.item(sel[0], "values")[0]
+            with db.conectar_bd() as conn:
+                conn.cursor().execute("UPDATE inmuebles SET eliminado = 2 WHERE id_inmueble = ?", (id_inm,))
+                conn.commit()
+            ejecutar_busqueda_automatica()
+
+        def mover_a_papelera_temporal():
+            sel = tree.selection()
+            if not sel: return
+            id_inm = tree.item(sel[0], "values")[0]
+            if messagebox.askyesno("Confirmar", "¿Mover inmueble a la papelera?"):
+                with db.conectar_bd() as conn:
+                    conn.cursor().execute("UPDATE inmuebles SET eliminado = 1 WHERE id_inmueble = ?", (id_inm,))
+                    conn.commit()
+                ejecutar_busqueda_automatica()
+
+        ctk.CTkButton(f_ops, text="👁️ Ver Detalles / Editar Todo", fg_color="#1976D2", command=abrir_ficha_edicion).pack(side="left", padx=5)
+        ctk.CTkButton(f_ops, text="🤝 Marcar Vendido / Rentado", fg_color="#2E7D32", command=marcar_como_vendido_ya).pack(side="left", padx=5)
+        ctk.CTkButton(f_ops, text="🗑️ Mover a Papelera", fg_color="#C62828", command=mover_a_papelera_temporal).pack(side="left", padx=5)
+
+    # ---------------------------------------------------------------------
+    # WINDOW: DETALLE / CONTROL INTERNO COMPLETO
+    # ---------------------------------------------------------------------
+    def lanzar_ventana_detalle_edicion(self, id_inmueble, callback_recarga):
+        v_det = ctk.CTkToplevel(self)
+        v_det.title(f"Ficha de Control Interno - ID #{id_inmueble}")
+        v_det.geometry("900x740")
+        v_det.grab_set()
+
+        self.fotos_db_local = []
+        self.indice_foto_actual = 0
+
+        def cargar_fotos_desde_bd():
+            with db.conectar_bd() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT id_foto, ruta_archivo, principal FROM fotos_inmueble WHERE id_inmueble=? ORDER BY principal DESC, id_foto ASC", (id_inmueble,))
+                self.fotos_db_local = cursor.fetchall()
+
+        with db.conectar_bd() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT i.titulo, i.precio, u.colonia, u.municipio, i.descripcion, i.m2_terreno, i.m2_construccion, i.tipo_operacion, i.tipo_inmueble, u.estado 
-                FROM inmuebles i
-                JOIN ubicaciones u ON i.id_ubicacion = u.id_ubicacion
-                WHERE i.id_inmueble=?
+                FROM inmuebles i JOIN ubicaciones u ON i.id_ubicacion = u.id_ubicacion WHERE i.id_inmueble=?
             """, (id_inmueble,))
-            reg = cursor.fetchone()
+            r = cursor.fetchone()
+        
+        cargar_fotos_desde_bd()
 
-        ctk.CTkLabel(ventana_edit, text="Título Comercial").pack()
-        txt_titulo_edit = ctk.CTkEntry(ventana_edit, width=380); txt_titulo_edit.pack(pady=2); txt_titulo_edit.insert(0, str(reg[0]))
-        ctk.CTkLabel(ventana_edit, text="Precio").pack()
-        txt_precio_edit = ctk.CTkEntry(ventana_edit, width=380); txt_precio_edit.pack(pady=2); txt_precio_edit.insert(0, str(reg[1]))
-        ctk.CTkLabel(ventana_edit, text="Colonia").pack()
-        txt_colonia_edit = ctk.CTkEntry(ventana_edit, width=380); txt_colonia_edit.pack(pady=2); txt_colonia_edit.insert(0, str(reg[2]))
-        ctk.CTkLabel(ventana_edit, text="Municipio / Alcaldía").pack()
-        txt_municipio_edit = ctk.CTkEntry(ventana_edit, width=380); txt_municipio_edit.pack(pady=2); txt_municipio_edit.insert(0, str(reg[3]))
-        ctk.CTkLabel(ventana_edit, text="Descripción").pack()
-        txt_desc_edit = ctk.CTkEntry(ventana_edit, width=380); txt_desc_edit.pack(pady=2); txt_desc_edit.insert(0, str(reg[4]))
-        ctk.CTkLabel(ventana_edit, text="M2 Terreno").pack()
-        txt_m2t_edit = ctk.CTkEntry(ventana_edit, width=380); txt_m2t_edit.pack(pady=2); txt_m2t_edit.insert(0, str(reg[5]))
-        ctk.CTkLabel(ventana_edit, text="M2 Construcción").pack()
-        txt_m2c_edit = ctk.CTkEntry(ventana_edit, width=380); txt_m2c_edit.pack(pady=2); txt_m2c_edit.insert(0, str(reg[6]))
+        scroll_izq = ctk.CTkScrollableFrame(v_det, fg_color="transparent")
+        scroll_izq.pack(side="left", fill="both", expand=True, padx=15, pady=15)
+        f_der = ctk.CTkFrame(v_det, width=360, fg_color="#ECEFF1")
+        f_der.pack(side="right", fill="y", padx=15, pady=15)
 
-        def agregar_fotos_local():
-            seleccion_fotos = filedialog.askopenfilenames(title="Agregar imágenes", filetypes=[("Imágenes", "*.jpg *.jpeg *.png")])
-            if not seleccion_fotos: return
-            carpeta = f"fotos/inmueble_{id_inmueble}"
-            os.makedirs(carpeta, exist_ok=True)
-            with conectar_bd() as conn:
-                cursor = conn.cursor()
-                for f in seleccion_fotos:
-                    dest = os.path.join(carpeta, os.path.basename(f))
-                    shutil.copy2(f, dest)
-                    cursor.execute("INSERT INTO fotos_inmueble(id_inmueble, ruta_archivo, descripcion, principal) VALUES (?,?,?,0)", (id_inmueble, dest, ""))
-                conn.commit()
-            messagebox.showinfo("Éxito", "Fotos añadidas.")
+# Campos Homologados a Pantalla de Alta de Inmuebles
+        def agregar_campo_scroll(texto):
+            f = ctk.CTkFrame(scroll_izq, fg_color="transparent")
+            f.pack(fill="x", pady=4)
+            # SE CORRIGE EL ANCHOR DE "w btn" A "w"
+            ctk.CTkLabel(f, text=texto, font=("Arial", 12, "bold"), width=150, anchor="w").pack(side="left")
+            return f
 
-        def ver_fotos():
-            ventana_fotos = ctk.CTkToplevel(ventana_edit)
-            ventana_fotos.title("Galería Fotográfica")
-            ventana_fotos.geometry("850x600")
-            
-            def renderizar_galeria():
-                for w in ventana_fotos.winfo_children(): w.destroy()
-                scroll = ctk.CTkScrollableFrame(ventana_fotos, width=800, height=550)
-                scroll.pack(fill="both", expand=True)
-                
-                with conectar_bd() as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT id_foto, ruta_archivo, principal FROM fotos_inmueble WHERE id_inmueble=? ORDER BY principal DESC", (id_inmueble,))
-                    fotos = cursor.fetchall()
+        e_op = ctk.CTkComboBox(agregar_campo_scroll("Tipo Operación:"), values=["VENTA", "RENTA"], width=280); e_op.pack(side="left"); e_op.set(r[7])
+        e_tipo = ctk.CTkComboBox(agregar_campo_scroll("Tipo Inmueble:"), values=["Casa", "Departamento", "Terreno", "Local", "Oficina"], width=280); e_tipo.pack(side="left"); e_tipo.set(r[8])
+        e_tit = ctk.CTkEntry(agregar_campo_scroll("Título Comercial:"), width=400); e_tit.pack(side="left"); e_tit.insert(0, str(r[0]))
+        e_prc = ctk.CTkEntry(agregar_campo_scroll("Precio:"), width=280); e_prc.pack(side="left"); e_prc.insert(0, str(r[1]))
+        e_col = ctk.CTkEntry(agregar_campo_scroll("Colonia:"), width=350); e_col.pack(side="left"); e_col.insert(0, str(r[2]))
+        e_mun = ctk.CTkEntry(agregar_campo_scroll("Municipio / Alc:"), width=350); e_mun.pack(side="left"); e_mun.insert(0, str(r[3]))
+        e_est = ctk.CTkEntry(agregar_campo_scroll("Estado:"), width=350); e_est.pack(side="left"); e_est.insert(0, str(r[9]))
+        e_m2t = ctk.CTkEntry(agregar_campo_scroll("M² Terreno:"), width=180); e_m2t.pack(side="left"); e_m2t.insert(0, str(r[5]))
+        e_m2c = ctk.CTkEntry(agregar_campo_scroll("M² Construcción:"), width=180); e_m2c.pack(side="left"); e_m2c.insert(0, str(r[6]))
+        e_des = ctk.CTkEntry(agregar_campo_scroll("Descripción / Notas:"), width=400); e_des.pack(side="left"); e_des.insert(0, str(r[4]))
 
-                ventana_fotos.img_refs = []
-                r, c = 0, 0
-                for id_f, ruta, p in fotos:
-                    if not os.path.exists(ruta): continue
-                    try:
-                        img = PILImage.open(ruta)
-                        img.thumbnail((160, 120))
-                        tk_img = ImageTk.PhotoImage(img)
-                        ventana_fotos.img_refs.append(tk_img)
-                    except: continue
+        lbl_canvas_foto = ctk.CTkLabel(f_der, text="[ Sin Fotografía ]")
+        lbl_canvas_foto.pack(pady=(20, 5), padx=10)
+        lbl_status_foto = ctk.CTkLabel(f_der, text="", font=("Arial", 11, "italic"), text_color="gray")
+        lbl_status_foto.pack()
 
-                    f_marco = ctk.CTkFrame(scroll)
-                    f_marco.grid(row=r, column=c, padx=10, pady=10)
-                    tk.Label(f_marco, image=tk_img).pack()
-                    
-                    lbl_txt = "⭐ PRINCIPAL" if p == 1 else "Alternativa"
-                    ctk.CTkLabel(f_marco, text=lbl_txt).pack()
-
-                    def hacer_p(f_id=id_f):
-                        with conectar_bd() as cn:
-                            cr = cn.cursor()
-                            cr.execute("UPDATE fotos_inmueble SET principal=0 WHERE id_inmueble=?", (id_inmueble,))
-                            cr.execute("UPDATE fotos_inmueble SET principal=1 WHERE id_foto=?", (f_id,))
-                        renderizar_galeria()
-
-                    def borrar_foto(f_id=id_f, archivo_ruta=ruta):
-                        if messagebox.askyesno("Confirmar", "¿Seguro que deseas eliminar esta fotografía?", parent=ventana_fotos):
-                            with conectar_bd() as cn:
-                                cr = cn.cursor()
-                                cr.execute("DELETE FROM fotos_inmueble WHERE id_foto=?", (f_id,))
-                                cn.commit()
-                            if os.path.exists(archivo_ruta): os.remove(archivo_ruta)
-                            renderizar_galeria()
-
-                    ctk.CTkButton(f_marco, text="Principal", width=120, height=24, command=hacer_p).pack(pady=2)
-                    ctk.CTkButton(f_marco, text="❌ Eliminar", fg_color="#D32F2F", width=120, height=24, command=borrar_foto).pack(pady=2)
-                    
-                    c += 1
-                    if c >= 4: c=0; r+=1
-            renderizar_galeria()
-
-        def generar_pdf_premium():
-            archivo_pdf = f"pdfs/Ficha_Premium_{id_inmueble}.pdf"
-            doc = SimpleDocTemplate(archivo_pdf, pagesize=(612, 792), rightMargin=40, leftMargin=40, topMargin=40, bottomMargin=40)
-            styles = getSampleStyleSheet()
-            
-            estilo_titulo = ParagraphStyle('T1', fontName='Helvetica-Bold', fontSize=24, textColor=colors.HexColor('#1A237E'), spaceAfter=4)
-            estilo_sub = ParagraphStyle('T2', fontName='Helvetica-Bold', fontSize=12, textColor=colors.HexColor('#5C6BC0'), spaceAfter=15)
-            estilo_normal = ParagraphStyle('N', fontName='Helvetica', fontSize=10, leading=14)
-            estilo_negrita = ParagraphStyle('B', fontName='Helvetica-Bold', fontSize=10, leading=14, textColor=colors.HexColor('#1A237E'))
-
-            elementos = [
-                Paragraph("<b>GARANZIA REAL ESTATE</b>", estilo_titulo),
-                Paragraph(f"Ficha Comercial Avanzada — ID Ref: #{id_inmueble}", estilo_sub),
-                Spacer(1, 10)
-            ]
-
-            with conectar_bd() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT ruta_archivo FROM fotos_inmueble WHERE id_inmueble=? ORDER BY principal DESC LIMIT 1", (id_inmueble,))
-                res_f = cursor.fetchone()
-            
-            if res_f and os.path.exists(res_f[0]):
+        def renderizar_foto_indice():
+            if not self.fotos_db_local:
+                lbl_canvas_foto.configure(image=None, text="[ Sin Fotografía ]")
+                lbl_status_foto.configure(text="")
+                return
+            if self.indice_foto_actual >= len(self.fotos_db_local): self.indice_foto_actual = 0
+            id_f, ruta, es_principal = self.fotos_db_local[self.indice_foto_actual]
+            if os.path.exists(ruta):
                 try:
-                    r_img = RLImage(res_f[0], width=350, height=220)
-                    elementos.append(r_img)
-                    elementos.append(Spacer(1, 15))
-                except: pass
+                    img_pil = PILImage.open(ruta)
+                    img_ctk = ctk.CTkImage(light_image=img_pil, dark_image=img_pil, size=(280, 200))
+                    lbl_canvas_foto.configure(image=img_ctk, text="")
+                    lbl_canvas_foto.image = img_ctk
+                    texto = f"Foto {self.indice_foto_actual + 1} de {len(self.fotos_db_local)}"
+                    if es_principal: texto += " ⭐ [PORTADA]"
+                    lbl_status_foto.configure(text=texto)
+                except Exception as e:
+                    print(f"Error al renderizar imagen: {e}")
 
-            datos_tabla = [
-                [Paragraph("<b>Título:</b>", estilo_negrita), Paragraph(txt_titulo_edit.get(), estilo_normal)],
-                [Paragraph("<b>Operación / Tipo:</b>", estilo_negrita), Paragraph(f"{reg[7]} - {reg[8]}", estilo_normal)],
-                [Paragraph("<b>Precio de Lista:</b>", estilo_negrita), Paragraph(f"${float(txt_precio_edit.get()):,.2f}", estilo_normal)],
-                [Paragraph("<b>Ubicación:</b>", estilo_negrita), Paragraph(f"Col. {txt_colonia_edit.get()}, {txt_municipio_edit.get()} - {reg[9]}", estilo_normal)],
-                [Paragraph("<b>Terreno / Construcción:</b>", estilo_negrita), Paragraph(f"T: {txt_m2t_edit.get()}m² | C: {txt_m2c_edit.get()}m²", estilo_normal)],
-                [Paragraph("<b>Descripción Completa:</b>", estilo_negrita), Paragraph(txt_desc_edit.get(), estilo_normal)]
-            ]
+        renderizar_foto_indice()
 
-            t = Table(datos_tabla, colWidths=[130, 400])
-            t.setStyle(TableStyle([
-                ('BACKGROUND', (0,0), (0,-1), colors.HexColor('#F9F9F9')),
-                ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor('#C5CAE9')),
-                ('VALIGN', (0,0), (-1,-1), 'TOP'),
-                ('PADDING', (0,0), (-1,-1), 6)
-            ]))
-            elementos.append(t)
-            doc.build(elementos)
-            messagebox.showinfo("PDF Creado", f"Guardado en: {archivo_pdf}")
+        f_nav = ctk.CTkFrame(f_der, fg_color="transparent")
+        f_nav.pack(pady=5)
+        ctk.CTkButton(f_nav, text="◀", width=40, command=lambda: [setattr(self, 'indice_foto_actual', (self.indice_foto_actual - 1) % len(self.fotos_db_local)) if self.fotos_db_local else None, renderizar_foto_indice()]).pack(side="left", padx=5)
+        ctk.CTkButton(f_nav, text="▶", width=40, command=lambda: [setattr(self, 'indice_foto_actual', (self.indice_foto_actual + 1) % len(self.fotos_db_local)) if self.fotos_db_local else None, renderizar_foto_indice()]).pack(side="left", padx=5)
 
-        def actualizar_inmueble():
-            id_ub_nueva = obtener_o_crear_ubicacion(txt_colonia_edit.get(), txt_municipio_edit.get(), reg[9])
-            with conectar_bd() as conn:
+        # -------------------------------------------------------------
+        # PRIMERO SE DECLARA EL CONTENEDOR (Arregla el NameError)
+        # -------------------------------------------------------------
+        f_gestion_fotos = ctk.CTkFrame(f_der, fg_color="transparent")
+        f_gestion_fotos.pack(pady=10, fill="x", padx=20)
+
+        # -------------------------------------------------------------
+        # SEGUNDO: LA FUNCIÓN QUE USA EL CONTENEDOR O LOS ELEMENTOS
+        # -------------------------------------------------------------
+        def agregar_nuevas_fotos_a_propiedad():
+            archivos = filedialog.askopenfilenames(title="Añadir Imágenes", filetypes=[("Imágenes", "*.jpg *.jpeg *.png")])
+            if archivos:
+                carpeta_prop = f"fotos/propiedad_{id_inmueble}"
+                os.makedirs(carpeta_prop, exist_ok=True)
+                with db.conectar_bd() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT COUNT(*) FROM fotos_inmueble WHERE id_inmueble=?", (id_inmueble,))
+                    conteo = cursor.fetchone()[0]
+                    for idx, ruta_orig in enumerate(archivos):
+                        ext = os.path.splitext(ruta_orig)[1]
+                        nombre_destino = f"{carpeta_prop}/inm_{id_inmueble}_add_{conteo + idx}{ext}"
+                        try:
+                            shutil.copy(ruta_orig, nombre_destino)
+                            cursor.execute("INSERT INTO fotos_inmueble (id_inmueble, ruta_archivo, principal) VALUES (?,?,0)", (id_inmueble, nombre_destino))
+                        except: print("Error de guardado")
+                    conn.commit()
+                cargar_fotos_desde_bd()
+                renderizar_foto_indice()
+
+        # -------------------------------------------------------------
+        # TERCERO: AHORA SÍ SE CREA EL BOTÓN DENTRO DE f_gestion_fotos
+        # -------------------------------------------------------------
+        ctk.CTkButton(f_gestion_fotos, text="📷 Añadir Fotos", fg_color="#5C6BC0", command=agregar_nuevas_fotos_a_propiedad).pack(fill="x", pady=3)
+
+        # -------------------------------------------------------------
+        # NUEVA FUNCIÓN: ASIGNAR PORTADA PRINCIPAL (⭐)
+        # -------------------------------------------------------------
+        def asignar_foto_portada_actual():
+            if not self.fotos_db_local:
+                messagebox.showwarning("Atención", "No hay fotografías en este inmueble para asignar como portada.")
+                return
+            
+            # Obtenemos los datos de la foto que está actualmente en pantalla
+            id_f, ruta, es_principal = self.fotos_db_local[self.indice_foto_actual]
+            
+            with db.conectar_bd() as conn:
                 cursor = conn.cursor()
-                cursor.execute("""
-                    UPDATE inmuebles 
-                    SET titulo=?, precio=?, id_ubicacion=?, descripcion=?, m2_terreno=?, m2_construccion=? 
-                    WHERE id_inmueble=?
-                """, (txt_titulo_edit.get(), float(txt_precio_edit.get()), id_ub_nueva, txt_desc_edit.get(), float(txt_m2t_edit.get()), float(txt_m2c_edit.get()), id_inmueble))
+                # 1. Ponemos en 0 todas las fotos de este inmueble
+                cursor.execute("UPDATE fotos_inmueble SET principal = 0 WHERE id_inmueble = ?", (id_inmueble,))
+                # 2. Ponemos en 1 únicamente la foto seleccionada actual
+                cursor.execute("UPDATE fotos_inmueble SET principal = 1 WHERE id_foto = ?", (id_f,))
                 conn.commit()
-            messagebox.showinfo("Modificado", "Datos del inmueble actualizados con éxito.")
-            ventana_edit.destroy()
-            cargar_datos()
+            
+            messagebox.showinfo("Éxito", "Esta imagen ha sido establecida como la portada oficial.")
+            
+            # Recargamos la lista local de fotos para que refleje el cambio de la estrella ⭐ inmediatamente
+            cargar_fotos_desde_bd()
+            renderizar_foto_indice()
 
-        ctk.CTkButton(ventana_edit, text="➕ Cargar Fotos", command=agregar_fotos_local, fg_color="#43A047").pack(pady=3)
-        ctk.CTkButton(ventana_edit, text="🖼️ Ver Galería", command=ver_fotos, fg_color="#E65100").pack(pady=3)
-        ctk.CTkButton(ventana_edit, text="📄 PDF Ficha Premium", command=generar_pdf_premium, fg_color="#1A237E").pack(pady=3)
-        ctk.CTkButton(ventana_edit, text="💾 Guardar Cambios", command=actualizar_inmueble, fg_color="#2E7D32").pack(pady=12)
+        # -------------------------------------------------------------
+        # NUEVO BOTÓN: ESTABLECER COMO PORTADA
+        # -------------------------------------------------------------
+        ctk.CTkButton(f_gestion_fotos, text="⭐ Seleccionar como Portada", fg_color="#F57C00", command=asignar_foto_portada_actual).pack(fill="x", pady=3)
 
-    tree.bind("<Double-1>", editar_inmueble)
+        def guardar_cambios_update():
+            id_ub = db.obtener_o_crear_ubicacion(e_col.get().strip(), e_mun.get().strip(), e_est.get().strip())
+            with db.conectar_bd() as conn:
+                conn.cursor().execute("""
+                    UPDATE inmuebles SET tipo_operacion=?, tipo_inmueble=?, titulo=?, precio=?, id_ubicacion=?, descripcion=?, m2_terreno=?, m2_construccion=? WHERE id_inmueble=?
+                """, (e_op.get(), e_tipo.get(), e_tit.get().strip(), float(e_prc.get()), id_ub, e_des.get().strip(), float(e_m2t.get()), float(e_m2c.get()), id_inmueble))
+                conn.commit()
+            callback_recarga()
+            v_det.destroy()
+            messagebox.showinfo("Éxito", "Todos los campos de la propiedad modificados correctamente.")
 
-# --------------------------------------------------------
-# ARRANQUE INICIAL DEL SISTEMA
-# --------------------------------------------------------
-cambiar_vista(frame_dashboard)
-app.mainloop()
+        def disparar_pdf_hilo():
+            datos_pdf = {
+                'titulo': e_tit.get(), 'operacion': e_op.get(), 'tipo': e_tipo.get(),
+                'precio': float(e_prc.get()), 'colonia': e_col.get(),
+                'municipio': e_mun.get(), 'estado': e_est.get(), 'm2t': float(e_m2t.get()), 'm2c': float(e_m2c.get()), 'descripcion': e_des.get()
+            }
+            ruta_foto = self.fotos_db_local[0][1] if self.fotos_db_local else None
+            archivo_res = pdf_generator.construir_pdf_propiedad(id_inmueble, datos_pdf, ruta_foto)
+            messagebox.showinfo("Éxito", f"Ficha Premium generada en /pdfs:\n{archivo_res}")
+
+        ctk.CTkButton(scroll_izq, text="💾 Guardar Cambios Integrales", fg_color="#2E7D32", height=40, command=guardar_cambios_update).pack(pady=15, fill="x")
+        ctk.CTkButton(scroll_izq, text="📄 Exportar a Ficha PDF Premium", fg_color="#1A237E", command=disparar_pdf_hilo).pack(fill="x", pady=5)
+
+# =====================================================================
+    # VENTANA: BUSCADOR DE PROSPECTOS OPERATIVO
+    # =====================================================================
+    def mostrar_buscador_prospectos(self):
+        self.ventana_prospectos = ctk.CTkToplevel(self)
+        self.ventana_prospectos.title("Buscador Operativo de Prospectos")
+        self.ventana_prospectos.geometry("1100x600")
+
+        frame_filtros = ctk.CTkFrame(self.ventana_prospectos, fg_color="white", border_width=1, border_color="#E0E0E0")
+        frame_filtros.pack(fill="x", padx=15, pady=10)
+
+        txt_buscar_nom = ctk.CTkEntry(frame_filtros, placeholder_text="Buscar por nombre...", width=250)
+        txt_buscar_nom.pack(side="left", padx=5, pady=8)
+
+        cmb_f_tipo = ctk.CTkComboBox(frame_filtros, values=["Todos", "Casa", "Departamento", "Terreno", "Local", "Oficina"], width=150)
+        cmb_f_tipo.pack(side="left", padx=5, pady=8)
+
+        frame_tabla = ctk.CTkFrame(self.ventana_prospectos)
+        frame_tabla.pack(fill="both", expand=True, padx=15, pady=5)
+
+        cols = ("ID", "NOMBRE", "TELEFONO", "CORREO", "PRESUPUESTO", "INTERES", "ASESOR")
+        tree = ttk.Treeview(frame_tabla, columns=cols, show="headings")
+        for c in cols: tree.heading(c, text=c); tree.column(c, anchor="center", width=130)
+        tree.pack(fill="both", expand=True)
+
+        def ejecutar_busqueda_prospectos(*args):
+            for item in tree.get_children(): tree.delete(item)
+            query = """
+                SELECT c.id_cliente, c.nombre, c.telephone, c.correo, c.presupuesto_max, u.colonia, a.nombre
+                FROM clientes c 
+                JOIN ubicaciones u ON c.id_ubicacion_interes = u.id_ubicacion
+                JOIN asesores a ON c.id_asesor = a.id_asesor
+                WHERE c.nombre LIKE ?
+            """
+            params = [f"%{txt_buscar_nom.get().strip()}%"]
+
+            if cmb_f_tipo.get() != "Todos":
+                query += " AND c.tipo_buscado = ?"
+                params.append(cmb_f_tipo.get())
+
+            with db.conectar_bd() as conn:
+                cursor = conn.cursor()
+                cursor.execute(query, params)
+                for row in cursor.fetchall(): tree.insert("", "end", values=row)
+
+        btn_filtrar = ctk.CTkButton(frame_filtros, text="🔍 Filtrar", command=ejecutar_busqueda_prospectos, fg_color="#1A237E", width=90)
+        btn_filtrar.pack(side="left", padx=10)
+
+        txt_buscar_nom.bind("<KeyRelease>", ejecutar_busqueda_prospectos)
+        cmb_f_tipo.configure(command=ejecutar_busqueda_prospectos)
+
+        ejecutar_busqueda_prospectos()
+
+        f_ops = ctk.CTkFrame(self.ventana_prospectos, fg_color="transparent")
+        f_ops.pack(fill="x", padx=15, pady=10)
+
+        def abrir_edicion_prospecto():
+            sel = tree.selection()
+            if not sel: return
+            self.lanzar_ventana_editar_prospecto(tree.item(sel[0], "values")[0], ejecutar_busqueda_prospectos)
+
+        def eliminar_prospecto_seguro():
+            sel = tree.selection()
+            if not sel: return
+            id_cli = tree.item(sel[0], "values")[0]
+            nom_cli = tree.item(sel[0], "values")[1]
+
+            if messagebox.askyesno("Confirmar Borrado", f"¿Está seguro de eliminar de forma permanente al cliente {nom_cli}?\nEsta acción purgará también sus citas agendadas."):
+                with db.conectar_bd() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("DELETE FROM citas WHERE id_cliente = ?", (id_cli,))
+                    cursor.execute("DELETE FROM clientes WHERE id_cliente = ?", (id_cli,))
+                    conn.commit()
+                ejecutar_busqueda_prospectos()
+                messagebox.showinfo("Purgado", "Prospecto eliminado de manera limpia de la base de datos.")
+
+        ctk.CTkButton(f_ops, text="👁️ Editar Prospecto", fg_color="#1976D2", command=abrir_edicion_prospecto).pack(side="left", padx=5)
+        ctk.CTkButton(f_ops, text="🗑️ Eliminar de Forma Segura", fg_color="#C62828", command=eliminar_prospecto_seguro).pack(side="left", padx=5)
+
+
+    # =====================================================================
+    # VENTANA MODAL: DETALLE Y EDICIÓN INDIVIDUAL DE PROSPECTO
+    # =====================================================================
+    def lanzar_ventana_editar_prospecto(self, id_cliente, callback_recarga):
+        v_edt = ctk.CTkToplevel(self)
+        v_edt.title(f"Modificar Datos del Prospecto - ID #{id_cliente}")
+        v_edt.geometry("600x550")
+        v_edt.grab_set()
+
+        with db.conectar_bd() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT c.nombre, c.telephone, c.correo, c.presupuesto_max, u.colonia, c.tipo_buscado, a.nombre
+                FROM clientes c 
+                JOIN ubicaciones u ON c.id_ubicacion_interes = u.id_ubicacion
+                JOIN asesores a ON c.id_asesor = a.id_asesor
+                WHERE c.id_cliente = ?
+            """, (id_cliente,))
+            r = cursor.fetchone()
+
+        scroll = ctk.CTkScrollableFrame(v_edt, fg_color="white", corner_radius=12, border_width=1, border_color="#E0E0E0")
+        scroll.pack(fill="both", expand=True, padx=15, pady=15)
+
+        ctk.CTkLabel(scroll, text="Editar Información del Prospecto", font=("Arial", 16, "bold"), text_color="#1A237E").pack(pady=10, anchor="w", padx=10)
+
+        def agregar_campo(texto):
+            f = ctk.CTkFrame(scroll, fg_color="transparent")
+            f.pack(fill="x", pady=6, padx=10)
+            ctk.CTkLabel(f, text=texto, font=("Arial", 11, "bold"), width=150, anchor="w").pack(side="left")
+            return f
+
+        e_nom = ctk.CTkEntry(agregar_campo("Nombre Completo:"), width=300); e_nom.pack(side="left"); e_nom.insert(0, str(r[0]))
+        e_tel = ctk.CTkEntry(agregar_campo("Teléfono (10 dgt):"), width=300); e_tel.pack(side="left"); e_tel.insert(0, str(r[1]))
+        e_cor = ctk.CTkEntry(agregar_campo("Correo Electrónico:"), width=300); e_cor.pack(side="left"); e_cor.insert(0, str(r[2]))
+        e_pre = ctk.CTkEntry(agregar_campo("Presupuesto Máximo:"), width=300); e_pre.pack(side="left"); e_pre.insert(0, str(r[3]))
+        e_col = ctk.CTkEntry(agregar_campo("Colonia de Interés:"), width=300); e_col.pack(side="left"); e_col.insert(0, str(r[4]))
+        
+        e_tipo = ctk.CTkComboBox(agregar_campo("Inmueble Solicitado:"), values=["Casa", "Departamento", "Terreno", "Local", "Oficina"], width=300)
+        e_tipo.pack(side="left"); e_tipo.set(r[5])
+
+        # Obtener lista actualizada de asesores para el ComboBox
+        lista_asesores = []
+        with db.conectar_bd() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT nombre FROM asesores")
+            lista_asesores = [row[0] for row in cursor.fetchall()]
+
+        e_ase = ctk.CTkComboBox(agregar_campo("Asesor Asignado:"), values=lista_asesores, width=300)
+        e_ase.pack(side="left"); e_ase.set(r[6])
+
+        def guardar_cambios_prospecto():
+            tel_val = e_tel.get().strip()
+            cor_val = e_cor.get().strip()
+            
+            if not tel_val.isdigit() or len(tel_val) != 10:
+                messagebox.showerror("Error de Formato", "El teléfono debe tener exactamente 10 dígitos.")
+                return
+            if "@" not in cor_val or "." not in cor_val:
+                messagebox.showerror("Error de Formato", "Ingrese un correo electrónico válido.")
+                return
+
+            id_ub = db.obtener_o_crear_ubicacion(e_col.get().strip(), "Por definir", "Por definir")
+            id_ase = self.obtener_id_asesor_por_nombre(e_ase.get())
+
+            with db.conectar_bd() as conn:
+                conn.cursor().execute("""
+                    UPDATE clientes 
+                    SET nombre=?, telephone=?, correo=?, presupuesto_max=?, id_ubicacion_interes=?, tipo_buscado=?, id_asesor=?
+                    WHERE id_cliente=?
+                """, (e_nom.get().strip(), tel_val, cor_val, float(e_pre.get()), id_ub, e_tipo.get(), id_ase, id_cliente))
+                conn.commit()
+
+            callback_recarga()
+            v_edt.destroy()
+            messagebox.showinfo("Éxito", "Los datos del prospecto han sido actualizados de forma segura.")
+
+        ctk.CTkButton(scroll, text="💾 Guardar Cambios del Prospecto", fg_color="#2E7D32", height=38, command=guardar_cambios_prospecto).pack(pady=20, fill="x", padx=10)
+
+if __name__ == "__main__":
+    app = SistemaInmobiliarioApp()
+    app.mainloop()
